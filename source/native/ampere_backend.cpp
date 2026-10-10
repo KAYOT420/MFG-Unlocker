@@ -1371,7 +1371,7 @@ template<size_t I> NVSDK_NGX_Result NVSDK_CONV Release(NVSDK_NGX_Handle* handle)
     std::unique_lock lock(gCalls);
     auto original = RouteOriginal<ReleaseFn>(gRoutes[I], gRoutes[I].release);
 #if MFG_UNLOCK_RUNTIME_GPU_SELECTION
-    // The runtime ReleaseFeature entry can report current=0 while its patch is live; failing here leaks the feature's VRAM.
+    // ReadSnapshot().current re-checks the entry's first bytes and can read stale while the hook is live; returning here would skip NVIDIA's release and leak the feature's VRAM.
     if (!original && !gpu_dispatch::IsAmpere())
     {
         const auto state = entry_detour::ReadSnapshot(gRoutes[I].release);
