@@ -2,7 +2,7 @@
 
 The v1.5.0 release combines the DLSS MFG backend, the built-in menu, RTX 30
 support and XeSS Multi Frame Generation (XeMFG) through OptiScaler in one
-DLL. ProductVersion is 1.5.0; FileVersion is 1.5.0.932.
+DLL. ProductVersion is 1.5.0; FileVersion is 1.5.0.933.
 
 The release target is `RTXMFGUnified`, producing `Release/MFGUnlocker.dll`.
 Use Windows x64, Visual Studio 2022/MSVC 14.38.33130, Windows SDK

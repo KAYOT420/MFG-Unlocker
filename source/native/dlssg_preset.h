@@ -56,5 +56,8 @@ bool Prepare() noexcept;
 void PrepareForExport(HMODULE module, const char* name) noexcept;
 // Bounded entry discovery; no NVIDIA initialization is invoked here.
 void ObserveProvider(HMODULE module, uint64_t generation) noexcept;
+// The provider's FG preset reader: every decoded preset-key call site must call this one
+// reader (known prologue, at its unwind entry). Null when absent or when sites disagree.
+void* FindPresetReader(HMODULE module) noexcept;
 Snapshot ReadSnapshot(HMODULE provider) noexcept;
 }

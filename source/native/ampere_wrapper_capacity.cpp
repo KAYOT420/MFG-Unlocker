@@ -9,7 +9,7 @@ namespace ampere_wrapper
 {
 namespace
 {
-// Independently traced in local production 2.13 and 2.14 wrappers. Every
+// Independently traced in local production 2.13 and 2.14 wrappers (OTA 2.14.16 included). Every
 // window must match one complete profile; version text grants no admission.
 struct Fields { size_t maximum, swapchain, count, buffers; };
 constexpr Fields kCompactFields{0x45dc, 0x4150, 0x4158, 0x42c0};
@@ -242,6 +242,9 @@ bool Discover(HMODULE module, Layout& layout) noexcept
         const uintptr_t compactContext = image.Unique(kCompactContextWindow, 32);
         const bool extended = extendedContext && image.Unique(kMaximumWindow)
             && image.Unique(kSwapchainCountWindow) && image.Unique(kBufferLoopWindow);
+        // OTA 2.14.16: the extended fields with the moved count override and its own Create frame.
+        const bool extendedOverride = extendedContext && image.Unique(kMaximumWindow)
+            && image.Unique(kOverrideSwapchainCountWindow) && image.Unique(kBufferLoopWindow);
         const bool compact = compactContext && image.Unique(kCompactMaximumWindow)
             && image.Unique(kCompactSwapchainCountWindow) && image.Unique(kCompactBufferLoopWindow);
         const uintptr_t pacerContext = image.Unique(kPacerContextWindow, 3, 10);
@@ -260,18 +263,19 @@ bool Discover(HMODULE module, Layout& layout) noexcept
         // Small-wrapper code over the pacer context: the pacer's fields and pre-frame-ID ordinals.
         const bool latePacer = smallContext && image.Unique(kLatePacerMaximumWindow)
             && image.Unique(kLatePacerBuffersWindow);
-        if (static_cast<unsigned>(extended) + compact + pacer + otaPacer + latePacer + legacyCompact + small + large
+        if (static_cast<unsigned>(extended) + extendedOverride + compact + pacer + otaPacer + latePacer + legacyCompact + small + large
             + direct != 1) return false;
         const bool pacerFields = pacer || otaPacer || latePacer;
         const bool legacy = pacerFields || legacyCompact || small || large;
         const bool fixedTwoX = legacy || direct;
-        const uintptr_t prologue = compact ? compactContext : extended ? extendedContext
+        const uintptr_t prologue = compact ? compactContext : extended || extendedOverride ? extendedContext
             : pacer ? pacerContext : otaPacer ? otaPacerContext : small || latePacer ? smallContext
             : large ? largeContext : direct ? compactContext : legacyCompactContext;
         const uintptr_t create = pacer || otaPacer ? image.Unique(kPacerCreateWindow)
             : small || latePacer ? image.Unique(kLegacySmallCreateWindow) : large ? image.Unique(kLegacyLargeCreateWindow)
             : direct ? image.Unique(kLegacyDirectCreateWindow)
-            : legacyCompact ? image.Unique(kLegacyCompactCreateWindow) : image.Unique(kCreateWindow);
+            : legacyCompact ? image.Unique(kLegacyCompactCreateWindow)
+            : extendedOverride ? image.Unique(kOverrideCreateWindow) : image.Unique(kCreateWindow);
         if (!prologue || !create) return false;
         // mov rbx,[rip+disp32] in the verified swap-chain entry.
         const uintptr_t slot = legacy ? prologue + 7 + Field<int32_t>(prologue, 3)
@@ -300,7 +304,7 @@ bool Discover(HMODULE module, Layout& layout) noexcept
             end = image.base + functions[i].EndAddress;
         }
         if (!end) return false;
-        layout = {module, slot, begin, end, compact ? Profile::eCompact : extended ? Profile::eExtended
+        layout = {module, slot, begin, end, compact ? Profile::eCompact : extended || extendedOverride ? Profile::eExtended
             : pacerFields ? Profile::eLegacyPacer : small ? Profile::eLegacySmall
             : large ? Profile::eLegacyLarge : direct ? Profile::eLegacyDirect : Profile::eLegacyCompact,
             fixedTwoX ? 1u : ampere_mfg::kMaximumGeneratedFrames, !pacerFields};

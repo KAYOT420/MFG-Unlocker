@@ -1862,15 +1862,26 @@ bool RoutePresetCurrent(const Route& route) noexcept
     return false;
 }
 
+// The settings reader called with the DLSS-FG preset ID. 310.9.16 reads it at
+// two decoded call sites (the setting and its report); several sites are
+// admitted only when every one calls the same reader, as on RTX 40.
+uintptr_t FindPresetReaderTarget(const Image& image, unsigned& matches) noexcept
+{
+    // mov ecx,DLSS-FG preset ID; call settings reader; test al,al; jz rel32.
+    constexpr uint8_t pattern[]{0xb9,0xf1,0x1d,0xe4,0x10,0xe8,0,0,0,0,0x84,0xc0,0x0f,0x84,0,0,0,0};
+    constexpr uint8_t mask[]{255,255,255,255,255,255,0,0,0,0,255,255,255,255,0,0,0,0};
+    const uintptr_t match = FindPattern(image, pattern, mask, sizeof(pattern), SIZE_MAX, 0, 0, &matches);
+    if (!match) return matches > 1 ? reinterpret_cast<uintptr_t>(dlssg_preset::FindPresetReader(image.module)) : 0;
+    int32_t displacement = 0; memcpy(&displacement, reinterpret_cast<void*>(match + 6), 4);
+    return match + 10 + displacement;
+}
+
 bool InstallPreset(Route& route, const Image& image) noexcept
 {
     if (route.preset) return entry_detour::ReadSnapshot(route.preset).current;
     if (route.legacyPresetReady) return true;
-    // mov ecx,DLSS-FG preset ID; call settings reader; test al,al; jz rel32.
-    constexpr uint8_t pattern[]{0xb9,0xf1,0x1d,0xe4,0x10,0xe8,0,0,0,0,0x84,0xc0,0x0f,0x84,0,0,0,0};
-    constexpr uint8_t mask[]{255,255,255,255,255,255,0,0,0,0,255,255,255,255,0,0,0,0};
     unsigned matches = 0;
-    const uintptr_t match = FindPattern(image, pattern, mask, sizeof(pattern), SIZE_MAX, 0, 0, &matches);
+    const uintptr_t target = FindPresetReaderTarget(image, matches);
     unsigned legacyMatches = 0;
     const bool legacy = LegacyPresetContract(image, legacyMatches);
     if (legacy && matches == 0 && Pin(image.module))
@@ -1880,7 +1891,7 @@ bool InstallPreset(Route& route, const Image& image) noexcept
         return true;
     }
     if (legacyMatches) return Reject(140);
-    if (!match)
+    if (!target)
     {
         wchar_t detail[192]{};
         swprintf_s(detail, L"Ampere FG preset discovery rejected: decoded call-site matches=%u (%s); module=%p generation=%llu",
@@ -1888,8 +1899,13 @@ bool InstallPreset(Route& route, const Image& image) noexcept
         Report(detail);
         return Reject(140);
     }
-    int32_t displacement = 0; memcpy(&displacement, reinterpret_cast<void*>(match + 6), 4);
-    const uintptr_t target = match + 10 + displacement;
+    if (matches > 1)
+    {
+        wchar_t detail[160]{};
+        swprintf_s(detail, L"Ampere FG preset discovery: %u decoded call sites share one reader at RVA 0x%llX",
+            matches, static_cast<unsigned long long>(target - image.base));
+        Report(detail);
+    }
     // The known reader takes uint32_t ID in ecx, uint32_t* in rdx and returns
     // bool in al. Require its complete argument-capture prologue, independently
     // of the eligibility version. This rejects different private ABIs.

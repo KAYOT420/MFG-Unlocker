@@ -492,6 +492,11 @@ void ObserveProvider(HMODULE module, uint64_t generation) noexcept
     }
 }
 
+void* FindPresetReader(HMODULE module) noexcept
+{
+    return FindCachedReader(module);
+}
+
 Snapshot ReadSnapshot(HMODULE provider) noexcept
 {
     const auto state = entry_detour::ReadSnapshot(entry_detour::Kind::eDlssgPresetRead);
