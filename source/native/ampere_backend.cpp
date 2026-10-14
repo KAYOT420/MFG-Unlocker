@@ -1387,6 +1387,15 @@ template<size_t I> NVSDK_NGX_Result NVSDK_CONV Release(NVSDK_NGX_Handle* handle)
 {
     std::unique_lock lock(gCalls);
     auto original = RouteOriginal<ReleaseFn>(gRoutes[I], gRoutes[I].release);
+#if MFG_UNLOCK_RUNTIME_GPU_SELECTION
+    // ReadSnapshot().current re-checks the entry's first bytes and can read stale while the hook is live; returning here would skip NVIDIA's release and leak the feature's VRAM.
+    if (!original && !gpu_dispatch::IsAmpere())
+    {
+        const auto state = entry_detour::ReadSnapshot(gRoutes[I].release);
+        if (state.installed && state.original && state.owner == gRoutes[I].module)
+            original = reinterpret_cast<ReleaseFn>(state.original);
+    }
+#endif
     if (!original) return NVSDK_NGX_Result_FAIL_NotInitialized;
     const uintptr_t handleValue = reinterpret_cast<uintptr_t>(handle);
 #if MFG_UNLOCK_RUNTIME_GPU_SELECTION
