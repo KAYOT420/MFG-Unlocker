@@ -39,40 +39,13 @@ option(MFG_UNLOCK_OUTPUT_PULL_MASK_OCCUPANCY
 if(MFG_UNLOCK_OUTPUT_PULL_MASK_OCCUPANCY AND NOT MFG_UNLOCK_OUTPUT_PULL_MASK_ONLY)
     message(FATAL_ERROR "The OutputPull mask occupancy candidate requires the mask-only path")
 endif()
-option(MFG_UNLOCK_OUTPUT_PULL_EXPERIMENT
-    "Use the exact-profile OutputPull backport plus six-block occupancy hint" OFF)
-if(MFG_UNLOCK_OUTPUT_PULL_MASK_ONLY AND MFG_UNLOCK_OUTPUT_PULL_EXPERIMENT)
-    message(FATAL_ERROR "Do not enable two publishers for the OutputPull descriptor")
-endif()
-option(MFG_UNLOCK_OUTPUT_PULL_TELEMETRY
-    "Write low-overhead OutputPull A/B provenance and FG activity telemetry" OFF)
-option(MFG_UNLOCK_PREV2CURR_EXPERIMENT
-    "Add the exact-profile Prev2CurrUnpackPull backport to the OutputPull experiment" OFF)
-if(MFG_UNLOCK_PREV2CURR_EXPERIMENT AND NOT MFG_UNLOCK_OUTPUT_PULL_EXPERIMENT)
-    message(FATAL_ERROR "The Prev2Curr experiment requires the OutputPull candidate")
-endif()
-option(MFG_UNLOCK_INTERM_SCATTER_EXPERIMENT
-    "Use the full exact-profile temporal scatter backport with both pull experiments" OFF)
-if(MFG_UNLOCK_INTERM_SCATTER_EXPERIMENT AND
-    (NOT MFG_UNLOCK_OUTPUT_PULL_EXPERIMENT OR NOT MFG_UNLOCK_PREV2CURR_EXPERIMENT))
-    message(FATAL_ERROR "The temporal scatter experiment requires the OutputPull and Prev2Curr candidates")
-endif()
 set(IMGUI_ROOT "" CACHE PATH
     "Path to the Dear ImGui source tree used by that ReShade version")
 
-option(MFG_UNLOCK_RUNTIME_GPU_SELECTION "Build one renamable Ada and experimental Ampere module" ON)
-if(NOT MFG_UNLOCK_RUNTIME_GPU_SELECTION)
-    message(FATAL_ERROR "This isolated unified source requires MFG_UNLOCK_RUNTIME_GPU_SELECTION=ON")
-endif()
-if(MFG_UNLOCK_OUTPUT_PULL_EXPERIMENT OR MFG_UNLOCK_OUTPUT_PULL_TELEMETRY
-   OR MFG_UNLOCK_PREV2CURR_EXPERIMENT OR MFG_UNLOCK_INTERM_SCATTER_EXPERIMENT)
-    message(FATAL_ERROR "Keep kernel experiments out of the unified build")
-endif()
 include(ampere_native_cache.cmake)
 if(NOT MFG_AMPERE_EMBEDDED_KERNELS)
     message(FATAL_ERROR "The unified distribution requires embedded SM86 kernels")
 endif()
-add_compile_definitions(MFG_UNLOCK_RUNTIME_GPU_SELECTION=1 MFG_UNLOCK_AMPERE_MFG=0)
 
 set(MFG_UNLOCK_CORE_SOURCES
     patcher.cpp
@@ -95,10 +68,7 @@ set(MFG_UNLOCK_CORE_SOURCES
     entry_detour.asm
     nvidia_mfg_policy.cpp
     temporal_interval_trace.cpp
-    hudless_probe.cpp
-    hudless_visualizer.cpp
     fault_capture.cpp
-    output_pull_telemetry.cpp
 )
 
 option(MFG_UNLOCK_BUILD_SINGLE_MODULE "Build integrated backend and ImGui UI" ON)
@@ -161,7 +131,7 @@ if(MFG_UNLOCK_BUILD_SINGLE_MODULE)
         set(MFG_XESS_SOURCES
             xess/xess_mod.cpp xess/universal_hooks.cpp xess/internal_api_guards.asm
             xess/sdk_pacing.cpp xess/game_profile.cpp xess/runtime_payload.cpp xess/xess_runtime.cpp
-            xess/present_capture.cpp xess/host_unlock.cpp xess/motion_fill.cpp xess/hudless_match.cpp)
+            xess/host_unlock.cpp xess/motion_fill.cpp xess/hudless_match.cpp)
         set(MFG_XESS_RESOURCES "${MFG_GENERATED}/embedded_xess_programs.rc" "${MFG_GENERATED}/embedded_xess_shaders.rc")
     endif()
 
@@ -215,15 +185,9 @@ if(MFG_UNLOCK_BUILD_SINGLE_MODULE)
         MFG_UNLOCK_OVERLAY_TEST_FAULTS=$<BOOL:${MFG_UNLOCK_OVERLAY_TEST_FAULTS}>
         MFG_UNLOCK_XESS=$<BOOL:${MFG_UNLOCK_XESS}>
         UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN ImTextureID=ImU64
-        MFG_UNLOCK_SINGLE_MODULE_UI=1 MFG_UNLOCK_UNIVERSAL_CONFIG=1
-        MFG_UNLOCK_RESHADE_UI_CLIENT=1 MFG_UNLOCK_V12_UNIVERSAL_UI=1
         VK_USE_PLATFORM_WIN32_KHR=1 VK_NO_PROTOTYPES=1 IMGUI_IMPL_VULKAN_NO_PROTOTYPES=1
         MFG_UNLOCK_OUTPUT_PULL_MASK_ONLY=$<BOOL:${MFG_UNLOCK_OUTPUT_PULL_MASK_ONLY}>
-        MFG_UNLOCK_OUTPUT_PULL_MASK_OCCUPANCY=$<BOOL:${MFG_UNLOCK_OUTPUT_PULL_MASK_OCCUPANCY}>
-        MFG_UNLOCK_OUTPUT_PULL_EXPERIMENT=$<BOOL:${MFG_UNLOCK_OUTPUT_PULL_EXPERIMENT}>
-        MFG_UNLOCK_OUTPUT_PULL_TELEMETRY=$<BOOL:${MFG_UNLOCK_OUTPUT_PULL_TELEMETRY}>
-        MFG_UNLOCK_PREV2CURR_EXPERIMENT=$<BOOL:${MFG_UNLOCK_PREV2CURR_EXPERIMENT}>
-        MFG_UNLOCK_INTERM_SCATTER_EXPERIMENT=$<BOOL:${MFG_UNLOCK_INTERM_SCATTER_EXPERIMENT}>)
+        MFG_UNLOCK_OUTPUT_PULL_MASK_OCCUPANCY=$<BOOL:${MFG_UNLOCK_OUTPUT_PULL_MASK_OCCUPANCY}>)
     target_include_directories(MfgSingleObjects PRIVATE
         "${MFG_GENERATED}"
         "${STREAMLINE_ROOT}/include" "${STREAMLINE_ROOT}/external/ngx-sdk/include"

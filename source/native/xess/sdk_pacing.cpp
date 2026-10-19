@@ -1,6 +1,5 @@
 #include "sdk_pacing.h"
 #include "sdk_pacing_dlssg.h"
-#include "sdk_bulk_profile.h"
 #include "xess_policy.h"
 #include "xess_mod.h"
 #include "overlay_device_identity.h"
@@ -37,9 +36,6 @@ struct Owner
     uintptr_t implementation{}, chain{}, presenter{}, native{}, device{};
     std::atomic<unsigned> pacedLogs{}, skippedLogs{};
     std::atomic<bool> disabled{}, retired{};
-    // dev.42: the presentation queue of an owner observed for the diagnostic capture
-    // (ObservePlain). Never used for pacing.
-    Microsoft::WRL::ComPtr<ID3D12CommandQueue> captureQueue;
     std::mutex clockMutex;
     // DLSS-G CPU pacer interval for the SDK's own pacing (all counts).
     cadence::BatchIntervalEstimator batchInterval;
@@ -107,38 +103,6 @@ bool ImageRange(const unsigned char* base, uintptr_t rva, size_t bytes, DWORD* p
         || bytes > uintptr_t(info.BaseAddress)+info.RegionSize-uintptr_t(base+rva)) return false;
     if (protection) *protection = info.Protect;
     return true;
-}
-
-// Every field read from the SDK must be a readable, pinned COM interface before
-// invoking it. Canonical identity is established with public unwrapping/QI.
-bool PinnedInterface(IUnknown* object, size_t last) noexcept
-{
-    uintptr_t table{};
-    std::array<uintptr_t, 44> entries{};
-    return last < entries.size() && Value(uintptr_t(object), table)
-        && Read(table, entries.data(), (last+1)*sizeof(uintptr_t))
-        && single_overlay::native::PinInterface(object, last);
-}
-
-bool DeviceMatches(ID3D12DeviceChild* child, IUnknown* expected) noexcept
-{
-    Microsoft::WRL::ComPtr<ID3D12Device> device;
-    Microsoft::WRL::ComPtr<IUnknown> identity;
-    return expected && PinnedInterface(child, 7)
-        && SUCCEEDED(child->GetDevice(IID_PPV_ARGS(&device))) && device
-        && single_overlay::dx12::DeviceIdentity(device.Get(), identity)
-        && identity.Get() == expected;
-}
-
-bool NativeQueue(ID3D12CommandQueue* input, IUnknown* deviceIdentity,
-    Microsoft::WRL::ComPtr<ID3D12CommandQueue>& native,
-    Microsoft::WRL::ComPtr<IUnknown>& identity) noexcept
-{
-    native.Reset(); identity.Reset();
-    return PinnedInterface(input, 2) && single_overlay::native::Unwrap(input, native)
-        && PinnedInterface(native.Get(), 18) && DeviceMatches(native.Get(), deviceIdentity)
-        && native->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT
-        && SUCCEEDED(native.As(&identity)) && identity;
 }
 
 bool ContextParts(const Route& current, void* handle, uintptr_t& implementation, uintptr_t& chain) noexcept
@@ -246,269 +210,6 @@ int64_t NowNs() noexcept
         + (ticks.QuadPart%frequency.QuadPart)*1000000000/frequency.QuadPart;
 }
 
-// File name of the module that holds address (empty if none): tells whether the
-// SDK's native swapchain is DXGI's own object or a layer (Streamline, OptiScaler).
-std::string ModuleOf(const void* address)
-{
-    HMODULE module{};
-    wchar_t path[MAX_PATH]{};
-    if (!address || !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        reinterpret_cast<LPCWSTR>(address), &module) || !GetModuleFileNameW(module, path, MAX_PATH)) return {};
-    const wchar_t* name = wcsrchr(path, L'\\'); name = name ? name+1 : path;
-    char narrow[MAX_PATH]{};
-    WideCharToMultiByte(CP_UTF8, 0, name, -1, narrow, int(sizeof(narrow)), nullptr, nullptr);
-    std::string text(narrow);
-    for (auto& c : text) if (c == '"' || c == '\\' || unsigned(c) < 0x20) c = '_';
-    return text;
-}
-
-// dev.20/dev.37: the SDK presents straight to DXGI's own swapchain (dev.19 log:
-// vtable_module and present1_module dxgi.dll), so no proxy sees its Present1. For an
-// observed owner that object's vtable pointer is swapped to a copy of DXGI's table
-// whose Present1 slot runs the capture's copy first, then calls DXGI's Present1. Every
-// other slot (ResizeBuffers included: the game's buffer count is kept) and the RTTI
-// locator before the table are DXGI's; other swapchains keep DXGI's table. All DXGI
-// swapchains share one vtable, so one copy serves every SDK swapchain. It lives in this
-// module's image (.data), so COM pinning checks (PinInterface/ImageSlot) still accept the
-// object. The object is never restored: it may already be released when its owner retires.
-using Present1Fn = HRESULT (STDMETHODCALLTYPE*)(IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*);
-constexpr size_t kPresent1Slot = 22;
-constexpr size_t kMinimumSwapchainSlots = 41; // IUnknown .. IDXGISwapChain4
-constexpr size_t kMaximumVtableSlots = 128;
-std::atomic<Present1Fn> dxgiPresent1{};
-alignas(64) void* present1Table[kMaximumVtableSlots+1]{};
-void** present1Source{}; // DXGI's table that present1Table copies (present1Mutex)
-size_t present1Slots{};
-std::mutex present1Mutex;
-
-// dev.37 diagnostic final-present capture (SetPresentCapture).
-std::atomic<const PresentCaptureHooks*> presentCapture{};
-
-HRESULT STDMETHODCALLTYPE CaptureDxgiPresent1(IDXGISwapChain1* self, UINT sync, UINT flags,
-    const DXGI_PRESENT_PARAMETERS* parameters)
-{
-    const auto original = dxgiPresent1.load(std::memory_order_acquire);
-    if (!(flags & DXGI_PRESENT_TEST))
-        if (const auto capture = presentCapture.load(std::memory_order_acquire)) capture->beforePresent1(self);
-    return original(self, sync, flags, parameters);
-}
-
-bool ImageBounds(HMODULE module, uintptr_t& begin, uintptr_t& end) noexcept
-{
-    const auto base = reinterpret_cast<const unsigned char*>(module);
-    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
-    if (!base || dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
-    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base+dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
-    begin = uintptr_t(base); end = begin+nt->OptionalHeader.SizeOfImage;
-    return true;
-}
-
-// Returns nullptr when installed, else the reason it was not.
-const char* InstallPresent1Gate(const Owner& owner, size_t& slots) noexcept
-{
-    slots = 0;
-    auto* native = reinterpret_cast<IDXGISwapChain1*>(owner.native);
-    if (!native || !PinnedInterface(native, 40)) return "native_interface";
-    void** const vtable = *reinterpret_cast<void***>(native);
-    if (vtable == present1Table+1) return "already";
-    uintptr_t begin{}, end{};
-    if (!ImageBounds(GetModuleHandleW(L"dxgi.dll"), begin, end)) return "dxgi_module";
-    const auto inImage = [&](const void* address, size_t bytes = 1) noexcept
-    { return uintptr_t(address) >= begin && uintptr_t(address) <= end-bytes; };
-    if (!inImage(vtable-1, (kMinimumSwapchainSlots+1)*sizeof(void*))) return "vtable_not_dxgi";
-    std::lock_guard lock(present1Mutex);
-    if (present1Source)
-    {
-        if (present1Source != vtable) return "vtable_differs";
-    }
-    else
-    {
-        size_t count{};
-        while (count < kMaximumVtableSlots && inImage(vtable+count, sizeof(void*)) && inImage(vtable[count])) ++count;
-        if (count < kMinimumSwapchainSlots) return "vtable_short";
-        dxgiPresent1.store(reinterpret_cast<Present1Fn>(vtable[kPresent1Slot]), std::memory_order_release);
-        present1Table[0] = vtable[-1]; // MSVC RTTI complete object locator
-        std::copy(vtable, vtable+count, present1Table+1);
-        present1Table[1+kPresent1Slot] = reinterpret_cast<void*>(&CaptureDxgiPresent1);
-        present1Slots = count; present1Source = vtable;
-    }
-    // Readers load the pointer once per call; either table is valid at any time.
-    if (InterlockedCompareExchangePointer(reinterpret_cast<void* volatile*>(native), present1Table+1, vtable) != vtable)
-        return "vtable_raced";
-    slots = present1Slots;
-    return nullptr;
-}
-
-// Returns nullptr when installed, else the reason it was not.
-const char* ArmPresent1Gate(const Owner& owner) noexcept
-{
-    const char* reason = "exception";
-    try
-    {
-        char value[8]{};
-        const DWORD length = GetEnvironmentVariableA("RTXMFG_XESS_PRESENT1_GATE", value, DWORD(sizeof(value)));
-        size_t slots{};
-        reason = length == 1 && value[0] == '0' ? "disabled" : InstallPresent1Gate(owner, slots);
-        xess_mod::WriteLog("flip_meter_present1_vtable", "\"generation\":"+std::to_string(owner.generation)+
-            ",\"installed\":"+(reason ? "false" : "true")+",\"reason\":\""+(reason ? reason : "none")+
-            "\",\"slots\":"+std::to_string(slots));
-    }
-    catch (...) {}
-    return reason;
-}
-
-// dev.49: the capture's Present1 slot on a layered native swap chain. Under OptiScaler
-// (Witcher, dev.48 log) the swap chain XeFG presents to is another layer's wrapper, not
-// DXGI's object (flip_meter_present1_vtable "vtable_not_dxgi"), so the capture never saw
-// a Present1 and stayed requested. For an owner observed for the capture, that object's
-// vtable pointer is swapped to a copy of the layer's own table whose Present1 slot runs
-// the capture's copy, then the layer's Present1. Nothing else changes. The layer's table
-// must be read-only image memory (PinInterface pins its module) whose executable run
-// (TableSlots) holds IDXGISwapChain4 and the class's own virtuals, such as the deleting
-// destructor Release reaches. One layer table at a time; never restored, like the DXGI slot.
-alignas(64) void* captureTable[kMaximumVtableSlots+1]{};
-void** captureSource{}; // the layer's table that captureTable copies (present1Mutex)
-size_t captureSlots{};
-std::atomic<Present1Fn> layerPresent1{};
-
-HRESULT STDMETHODCALLTYPE CapturePresent1(IDXGISwapChain1* self, UINT sync, UINT flags,
-    const DXGI_PRESENT_PARAMETERS* parameters)
-{
-    const auto original = layerPresent1.load(std::memory_order_acquire);
-    if (!(flags & DXGI_PRESENT_TEST))
-        if (const auto capture = presentCapture.load(std::memory_order_acquire)) capture->beforePresent1(self);
-    return original(self, sync, flags, parameters);
-}
-
-bool ReadOnlyImage(const void* address) noexcept
-{
-    MEMORY_BASIC_INFORMATION info{};
-    return VirtualQuery(address, &info, sizeof(info)) == sizeof(info) && info.State == MEM_COMMIT
-        && info.Type == MEM_IMAGE && (info.Protect & 0xff) == PAGE_READONLY && !(info.Protect & PAGE_GUARD);
-}
-
-bool ExecutableMemory(uintptr_t address) noexcept
-{
-    MEMORY_BASIC_INFORMATION info{};
-    if (address < 0x10000 || VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info)) != sizeof(info)) return false;
-    constexpr DWORD kExecute = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
-    return info.State == MEM_COMMIT && (info.Protect & kExecute) && !(info.Protect & PAGE_GUARD);
-}
-
-// The slots a table holds: consecutive entries that point into executable memory
-// (interface methods, then the class's own virtuals such as the deleting
-// destructor that `delete this` in Release reaches through this very table). The
-// next table's RTTI locator or any data ends the run.
-size_t TableSlots(void** source) noexcept
-{
-    size_t count{};
-    uintptr_t entry{};
-    while (count < kMaximumVtableSlots && Value(uintptr_t(source+count), entry) && ExecutableMemory(entry)) ++count;
-    return count;
-}
-
-bool OurTable(void** table) noexcept
-{
-    return table == present1Table+1 || table == captureTable+1;
-}
-
-// Returns nullptr when installed, else the reason it was not; source = the object's table.
-const char* InstallCapturePresent1(const Owner& owner, size_t& slots, void**& source) noexcept
-{
-    slots = 0; source = nullptr;
-    auto* native = reinterpret_cast<IDXGISwapChain1*>(owner.native);
-    if (!native || !PinnedInterface(native, 40)) return "native_interface";
-    void** const vtable = *reinterpret_cast<void***>(native);
-    source = vtable;
-    if (vtable == captureTable+1) return "already";
-    if (OurTable(vtable)) return "vtable_ours";
-    const size_t count = TableSlots(vtable);
-    if (count < kMinimumSwapchainSlots) return "vtable_short";
-    if (count >= kMaximumVtableSlots) return "vtable_long";
-    if (!ReadOnlyImage(vtable) || !ReadOnlyImage(vtable+count-1)) return "vtable_writable";
-    uintptr_t locator{};
-    if (!Value(uintptr_t(vtable-1), locator)) return "vtable_locator";
-    std::lock_guard lock(present1Mutex);
-    if (captureSource)
-    {
-        if (captureSource != vtable) return "vtable_differs";
-    }
-    else
-    {
-        layerPresent1.store(reinterpret_cast<Present1Fn>(vtable[kPresent1Slot]), std::memory_order_release);
-        captureTable[0] = reinterpret_cast<void*>(locator); // MSVC RTTI complete object locator
-        std::copy(vtable, vtable+count, captureTable+1);
-        captureTable[1+kPresent1Slot] = reinterpret_cast<void*>(&CapturePresent1);
-        captureSlots = count; captureSource = vtable;
-    }
-    if (InterlockedCompareExchangePointer(reinterpret_cast<void* volatile*>(native), captureTable+1, vtable) != vtable)
-        return "vtable_raced";
-    slots = captureSlots;
-    return nullptr;
-}
-
-void ArmCapturePresent1(const Owner& owner) noexcept
-{
-    try
-    {
-        size_t slots{};
-        void** source{};
-        const char* reason = InstallCapturePresent1(owner, slots, source);
-        xess_mod::WriteLog("capture_present1_vtable", "\"generation\":"+std::to_string(owner.generation)+
-            ",\"installed\":"+(reason ? "false" : "true")+",\"reason\":\""+(reason ? reason : "none")+
-            "\",\"slots\":"+std::to_string(slots)+",\"module\":\""+ModuleOf(source)+"\"");
-    }
-    catch (...) {}
-}
-
-// dev.42: an owner observed for the diagnostic final-present capture: the SDK's presentation
-// queue, read from the presenter's copy queue field and checked against the chain's, and the
-// Present1 slot. Pacing is unchanged; any failure only leaves the capture without this owner.
-// dev.49: a layered native swap chain gets the capture-only Present1 slot instead
-// (ArmCapturePresent1), only while the capture's hooks are registered.
-void ObservePlain(Owner& owner, ID3D12Device* device) noexcept
-{
-    const bool capture = presentCapture.load(std::memory_order_acquire) != nullptr;
-    const char* reason{};
-    try
-    {
-        Microsoft::WRL::ComPtr<IUnknown> deviceIdentity, queueIdentity;
-        uintptr_t presenterQueue{}, chainQueue{};
-        if (!single_overlay::dx12::DeviceIdentity(device, deviceIdentity)) reason = "device_identity";
-        else if (!Value(owner.presenter+bulk_profile::kPresenterCopyQueueOffset, presenterQueue) || !presenterQueue
-            || !Value(owner.chain+0x28, chainQueue) || chainQueue != presenterQueue) reason = "queue_layout";
-        else if (!NativeQueue(reinterpret_cast<ID3D12CommandQueue*>(presenterQueue), deviceIdentity.Get(),
-            owner.captureQueue, queueIdentity)) reason = "queue_identity";
-    }
-    catch (...) { reason = "exception"; }
-    if (reason) owner.captureQueue.Reset();
-    else if (const char* gate = ArmPresent1Gate(owner); gate && !strcmp(gate, "vtable_not_dxgi") && capture)
-        ArmCapturePresent1(owner);
-    try
-    {
-        xess_mod::WriteLog("capture_observer", "\"generation\":"+std::to_string(owner.generation)+
-            ",\"observed\":"+(reason ? "false" : "true")+",\"capture\":"+(capture ? "true" : "false")+
-            (reason ? ",\"reason\":\""+std::string(reason)+"\"" : ""));
-    }
-    catch (...) {}
-}
-
-// dev.37: the observed owner whose native Present this is, and which output of a generating
-// batch it presents (eOther: any other Present on that presenter).
-std::shared_ptr<Owner> ObservedOwner(const Route& current, const Invocation& call, OutputKind& kind)
-{
-    const auto offset = call.returnAddress-uintptr_t(current.module);
-    kind = offset == kFirstReturn ? OutputKind::eFirst : offset == kExtraReturn ? OutputKind::eExtra
-        : offset == kRealReturn ? OutputKind::eReal : OutputKind::eOther;
-    if (const auto owners = current.owners.load(std::memory_order_acquire))
-        for (const auto& owner : *owners)
-            if (owner->presenter == uintptr_t(call.presenter) && owner->captureQueue
-                && !owner->retired.load(std::memory_order_acquire) && !owner->disabled.load(std::memory_order_acquire))
-                return owner;
-    return {};
-}
-
 HRESULT Dispatch(Route& current, const Invocation& call)
 {
     const DWORD incomingError = GetLastError();
@@ -552,14 +253,6 @@ HRESULT Dispatch(Route& current, const Invocation& call)
             }
         }
         catch (...) {} // The added pacing must not replace the original Present result.
-    }
-    // dev.37 diagnostic capture: which output this Present is, on the SDK's presentation queue.
-    if (const auto capture = presentCapture.load(std::memory_order_acquire))
-    {
-        std::shared_ptr<Owner> observedOwner;
-        OutputKind outputKind{OutputKind::eOther};
-        try { observedOwner = ObservedOwner(current, call, outputKind); } catch (...) {}
-        if (observedOwner) capture->beforeOutput(outputKind, uint32_t(call.frame >> 32), observedOwner->captureQueue.Get());
     }
     SetLastError(incomingError);
     return current.original(call.presenter, call.sync, call.flags, call.frame, call.parameters, call.resource, call.generated);
@@ -734,7 +427,7 @@ bool Install(HMODULE provider, std::string& failure) noexcept
     return false;
 }
 
-bool Register(void* handle, uint64_t generation, ID3D12Device* device, std::string& failure, bool observe) noexcept
+bool Register(void* handle, uint64_t generation, ID3D12Device* device, std::string& failure) noexcept
 {
     try
     {
@@ -769,7 +462,6 @@ bool Register(void* handle, uint64_t generation, ID3D12Device* device, std::stri
                 throw std::runtime_error("pacing_owner_collision");
         }
         if (next->size() >= 8) throw std::runtime_error("pacing_owner_capacity");
-        if (observe) ObservePlain(*owner, device);
         next->push_back(owner);
         current->owners.store(next, std::memory_order_release);
         xess_mod::WriteLog("extra_pacing_owner", "\"generation\":"+std::to_string(generation)+
@@ -777,8 +469,7 @@ bool Register(void* handle, uint64_t generation, ID3D12Device* device, std::stri
             ",\"presenter\":"+std::to_string(owner->presenter)+",\"native_swapchain\":"+std::to_string(owner->native)+
             ",\"application_device\":"+std::to_string(uintptr_t(device))+
             ",\"presenter_device\":"+std::to_string(presenterDevice)+
-            ",\"native_device_identity_used\":"+(presenterDevice != uintptr_t(device) ? "true" : "false")+
-            ",\"observed\":"+(owner->captureQueue ? "true" : "false"));
+            ",\"native_device_identity_used\":"+(presenterDevice != uintptr_t(device) ? "true" : "false"));
         return true;
     }
     catch (const std::exception& error) { failure = error.what(); }
@@ -823,10 +514,5 @@ void Unregister(void* handle, uint64_t generation) noexcept
             current->owners.store({}, std::memory_order_release);
         }
     }
-}
-
-void SetPresentCapture(const PresentCaptureHooks* hooks) noexcept
-{
-    presentCapture.store(hooks, std::memory_order_release);
 }
 }

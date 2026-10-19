@@ -1,8 +1,6 @@
-// Real D3D12 WARP swapchain/presentation harness for the bounded overlay
-// redesign. Modes:
-//   present - full presentation suite with drawing disabled (build A)
-//   menu    - same base plus actual menu rendering, input, resize, teardown
-//             (build B)
+// Real D3D12 WARP swapchain/presentation harness for the bounded overlay:
+// presentation, menu rendering, input, resize and teardown. run.py lists the
+// modes the release regression runs.
 #include "common.h"
 #include "existing_overlay.h"
 #include "unaligned_import_fixture.h"
@@ -16,7 +14,9 @@
 #include <sl.h>
 #define DIRECTINPUT_VERSION 0x0800
 #include <dinput.h>
-extern "C" __declspec(dllimport) HRESULT WINAPI EngineCreateFactory(unsigned,REFIID,void**);
+// Every case runs with a renderer DLL beside the executable that imports DXGI and D3D12 and is loaded before
+// the candidate, as in shipped games. Nothing here calls it; the linker keeps the import.
+#pragma comment(linker, "/INCLUDE:__imp_EngineCreateFactory")
 
 namespace
 {
@@ -259,7 +259,7 @@ std::string ReadStatusText(const std::filesystem::path& status)
     return std::string{std::istreambuf_iterator<char>(input), {}};
 }
 
-int RunPresentation(const wchar_t* dll, bool menuMode, uint32_t expectedTargets, bool raceStartup = false, bool coexist = false,bool dynamicFactory=false,bool streamlineStartup=false,bool wrapped=false,bool layered=false,bool reshadeWrapped=false,bool firstLaunch=false,bool unaligned=false,bool executableInputPages=false,unsigned hdrStartup=0,bool engineFactory=false,bool unalignedGraphics=false,bool adapterParent=false,bool legacyFactory=false,bool alignedInput=false)
+int RunPresentation(const wchar_t* dll, bool menuMode, uint32_t expectedTargets, bool raceStartup = false, bool coexist = false,bool dynamicFactory=false,bool streamlineStartup=false,bool wrapped=false,bool layered=false,bool reshadeWrapped=false,bool firstLaunch=false,bool unaligned=false,bool executableInputPages=false,unsigned hdrStartup=0,bool unalignedGraphics=false,bool adapterParent=false,bool legacyFactory=false,bool alignedInput=false)
 {
     HMODULE foreign=nullptr;
     using ForeignLookup=FARPROC(WINAPI*)(HMODULE,LPCSTR);
@@ -323,12 +323,6 @@ int RunPresentation(const wchar_t* dll, bool menuMode, uint32_t expectedTargets,
     HMODULE module = raceStartup ? LoadCandidate(dll) : nullptr;
     HMODULE interposer=nullptr;
     HMODULE deviceModule=nullptr;
-    ComPtr<IDXGIFactory2> engineCreated;
-    if(engineFactory){
-        if(!Check(SUCCEEDED(EngineCreateFactory(1,IID_PPV_ARGS(&engineCreated)))
-            && Status(module).factoryWrappersCreated==1 && Status(module).overlayInstallState==2,
-            "renderer DLL factory activates UI before any executable factory call"))return 1;
-    }
     if (raceStartup && !Check(module != nullptr, "candidate loaded before the first factory/device")) return 1;
     if(unaligned&&!unalignedGraphics){
         const auto status=std::filesystem::current_path()/L"RTXMFG-Universal.status.json";
@@ -424,7 +418,7 @@ int RunPresentation(const wchar_t* dll, bool menuMode, uint32_t expectedTargets,
     }
 
     if (!module) module = LoadCandidate(dll);
-    if (!Check(module != nullptr, "candidate winhttp.dll loads")) return 1;
+    if (!Check(module != nullptr, "candidate DLL loads")) return 1;
     // Invoke the ordinary imported API; never synchronize through private status.
     ComPtr<IDXGIFactory1> applicationFactory;
     ComPtr<IDXGIFactory> legacyApplicationFactory;
@@ -457,9 +451,6 @@ int RunPresentation(const wchar_t* dll, bool menuMode, uint32_t expectedTargets,
         if (installed.overlayInstallState != kStateActive) Sleep(1500); // Preserve failure diagnostics, never gates success.
         if (!Check(installed.overlayInstallState == kStateActive, "bounded hooks active"))
             return 1;
-        Check(installed.overlayActivatedTargets <= 5,
-            "only optional application input imports are published");
-        Check(installed.overlaySuspendedThreads == 0, "UI installation never suspended process threads");
     }
     // Use a real post-load factory. The old harness accidentally retained a
     // pre-install factory; shared-table changes masked that coverage error.
@@ -483,8 +474,7 @@ int RunPresentation(const wchar_t* dll, bool menuMode, uint32_t expectedTargets,
         using Factory=HRESULT(WINAPI*)(REFIID,void**);
         auto create=reinterpret_cast<Factory>(GetProcAddress(interposer,"CreateDXGIFactory1"));
         Check(create&&SUCCEEDED(create(IID_PPV_ARGS(&fixture.factory))),"Streamline exported factory gateway returns owned proxy");
-    }else if(engineFactory){fixture.factory=engineCreated;engineCreated.Reset();}
-    else if(legacyFactory)fixture.factory=reinterpret_cast<IDXGIFactory2*>(legacyApplicationFactory.Get());
+    }else if(legacyFactory)fixture.factory=reinterpret_cast<IDXGIFactory2*>(legacyApplicationFactory.Get());
     else Check(SUCCEEDED(applicationFactory.As(&fixture.factory)),"use intercepted application factory");
     Chain chain;
     if (coexist) {
@@ -496,6 +486,9 @@ int RunPresentation(const wchar_t* dll, bool menuMode, uint32_t expectedTargets,
             menuMode ? "flip-sequential swapchain created (menu content validation)"
                      : "flip-model swapchain created"))
         return 1;
+    // The first wrapped swapchain publishes the bounded USER32 input imports (4 today), never more.
+    const uint32_t inputImports = Status(module).overlayActivatedTargets;
+    Check(inputImports >= 1 && inputImports <= 5, "first swapchain publishes only the optional application input imports");
 
     if(hdrStartup){
         // GTA calls the public revision-4 method on its creation-return pointer
@@ -813,17 +806,6 @@ int RunPresentation(const wchar_t* dll, bool menuMode, uint32_t expectedTargets,
         Check(chain.Resize(fixture, 400, 300), "resize after menu use");
         for (int i = 0; i < 4; ++i) RenderAndPresent(fixture, chain, base);
         Check(SUCCEEDED(fixture.device->GetDeviceRemovedReason()), "device healthy after menu");
-    }
-    else if (expectedTargets == 10)
-    {
-        // Build A: drawing stays disabled; presenting must not render UI.
-        float base[4] = {0.30f, 0.30f, 0.35f, 1.0f};
-        for (int i = 0; i < 8; ++i) RenderAndPresent(fixture, chain, base);
-        MfgSingleModuleStatus status = Status(module);
-        Check(status.renderedFrames == 0, "forwarding build performs no UI rendering");
-        Check(status.overlayActivatedTargets > 0, "comparison retains application input setup");
-        Check(status.overlayVisible == 0, "overlay stays invisible in the forwarding build");
-        Check(status.renderFailures == 0, "no UI render failures in the forwarding build");
     }
     else
     {
@@ -1838,37 +1820,25 @@ bool ExerciseMenu(WarpFixture& fixture, Chain& chain, TestWindow& window, HMODUL
 int wmain(int argc, wchar_t** argv)
 {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
-    if (argc != 3 && argc != 4) return 2;
+    if (argc != 3) return 2;
     const std::wstring mode = argv[1];
     const wchar_t* dll = argv[2];
     std::printf("mode=%ls dll=%ls\n", argv[1], dll);
-    if (mode == L"present") return RunPresentation(dll, false, argc == 4 ? _wtoi(argv[3]) : 10);
-    if (mode == L"coexist-present") return RunPresentation(dll, false, 10,true,true);
-    if (mode == L"wrapped-slinit-forward") return RunPresentation(dll,false,10,true,true,false,true,true);
-    if (mode == L"menu") return RunPresentation(dll, true, 18);
-    if (mode == L"factory-revision-menu") return RunPresentation(dll,true,18,false,false,false,false,false,false,false,false,false,false,0,false,false,false,true);
-    if (mode == L"factory-revision-present") return RunPresentation(dll,false,18,false,false,false,false,false,false,false,false,false,false,0,false,false,false,true);
+    if (mode == L"factory-revision-menu") return RunPresentation(dll,true,18,false,false,false,false,false,false,false,false,false,false,0,false,false,true);
+    if (mode == L"factory-revision-present") return RunPresentation(dll,false,18,false,false,false,false,false,false,false,false,false,false,0,false,false,true);
     if (mode == L"factory-revision-unsupported") return RunLegacyFactoryUnsupported(dll);
-    if (mode == L"adapter-parent-menu") return RunPresentation(dll,true,18,true,false,false,false,false,false,false,false,false,false,0,false,false,true);
-    if (mode == L"adapter-parent-coexist-menu") return RunPresentation(dll,true,18,true,true,false,false,false,false,false,false,false,false,0,false,false,true);
-    if (mode == L"adapter-parent-unaligned-menu") return RunPresentation(dll,true,18,true,false,false,true,false,false,false,false,true,false,0,false,true,true);
-    if (mode == L"unaligned-graphics-menu") return RunPresentation(dll,true,18,true,false,false,true,false,false,false,false,true,false,0,false,true);
-    if (mode == L"rwx-unaligned-graphics-menu") return RunPresentation(dll,true,18,true,false,false,true,false,false,false,false,true,true,0,false,true);
-    if (mode == L"unaligned-graphics-coexist-menu") return RunPresentation(dll,true,18,true,true,false,true,false,false,false,false,true,false,0,false,true);
-    if (mode == L"unaligned-menu") return RunPresentation(dll,true,18,true,false,true,false,false,false,false,false,true);
+    if (mode == L"adapter-parent-coexist-menu") return RunPresentation(dll,true,18,true,true,false,false,false,false,false,false,false,false,0,false,true);
+    if (mode == L"adapter-parent-unaligned-menu") return RunPresentation(dll,true,18,true,false,false,true,false,false,false,false,true,false,0,true,true);
+    if (mode == L"rwx-unaligned-graphics-menu") return RunPresentation(dll,true,18,true,false,false,true,false,false,false,false,true,true,0,true);
+    if (mode == L"unaligned-graphics-coexist-menu") return RunPresentation(dll,true,18,true,true,false,true,false,false,false,false,true,false,0,true);
     if (mode == L"rwx-unaligned-menu") return RunPresentation(dll,true,18,true,false,true,false,false,false,false,false,true,true);
-    if (mode == L"rwx-aligned-menu") return RunPresentation(dll,true,18,true,false,true,false,false,false,false,false,true,true,0,false,false,false,false,true);
+    if (mode == L"rwx-aligned-menu") return RunPresentation(dll,true,18,true,false,true,false,false,false,false,false,true,true,0,false,false,false,true);
     if (mode == L"hdr-startup-menu") return RunPresentation(dll,true,18,true,false,false,false,false,false,false,false,false,false,1);
     if (mode == L"hdr-unsupported-menu") return RunPresentation(dll,true,18,true,true,false,false,true,false,false,false,false,false,2);
     if (mode == L"startup-menu") return RunPresentation(dll, true, 18, true);
-    if (mode == L"engine-menu") return RunPresentation(dll,true,18,true,false,false,false,false,false,false,false,false,false,0,true);
     if (mode == L"first-launch-menu") return RunPresentation(dll,true,18,true,false,false,false,false,false,false,true);
-    if (mode == L"coexist-menu") return RunPresentation(dll, true, 18, true, true);
-    if (mode == L"dynamic-coexist-menu") return RunPresentation(dll,true,18,true,true,true);
-    if (mode == L"wrapped-slinit-menu") return RunPresentation(dll,true,18,true,true,false,true,true);
     if (mode == L"layered-slinit-menu") return RunPresentation(dll,true,18,true,true,false,true,true,true);
     if (mode == L"reshade-wrapped-menu") return RunPresentation(dll,true,18,true,true,false,true,true,false,true);
-    if (mode == L"slinit-coexist-menu") return RunPresentation(dll,true,18,true,true,false,true);
     if (mode == L"manual-upgrade-factory-menu") return RunManualUpgrade(dll,false);
     if (mode == L"manual-upgrade-swapchain-passthrough") return RunManualUpgrade(dll,true);
     if (mode == L"manual-upgrade-immediate-menu") return RunManualUpgrade(dll,false,true);

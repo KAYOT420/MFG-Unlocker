@@ -87,13 +87,17 @@ Test projects:
   must load the freshly built DLL. The Vulkan cases use a real Vulkan device;
   DirectX 12 presentation cases use WARP. They exercise synthetic presentation
   and control paths, not a game's Frame Generation output.
-- `tests/provider_310916`: DLSS Frame Generation 310.9.16 (Preset C) admission
-  audits against the 310.9.0 and 310.9.16 providers, mapped without running
-  provider code. Its RTX 30 audit is built only when configured with the same
-  `MFG_AMPERE_*` SM86 cache arguments as the release, and checks that the
-  complete 26-slot native program is selected.
-- `tests/ampere_font` and `tests/ampere_runtime`: RTX 30 publication, selection
-  and policy checks with data-only provider images and mock CUDA calls.
+- `tests/provider_audits`: DLSS Frame Generation provider admission audits
+  (310.9.0 and 310.9.16, Preset C) against those providers, mapped without
+  running provider code. Its RTX 30 audit is built only when configured with the
+  same `MFG_AMPERE_*` SM86 cache arguments as the release, and checks that the
+  complete 26-slot native program is selected from the embedded kernels.
+- `tests/ampere_audits` and `tests/ampere_runtime`: RTX 30 font, publication,
+  selection and policy checks with data-only provider images and mock CUDA calls.
+  `ampere_runtime`'s CTest runs the batch, options, status and Streamline OTA
+  checks, which need no inputs. Its flip-metering, wrapper, selection and
+  architecture tests take real `sl.dlss_g.dll` wrappers and DLSS-G providers
+  as arguments.
 
 These checks do not establish live provider execution or correct final
 presentation in a game.

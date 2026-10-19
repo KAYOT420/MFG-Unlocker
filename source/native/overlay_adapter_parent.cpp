@@ -1,4 +1,5 @@
 #include "overlay_adapter_parent.h"
+#include "process_mitigations.h"
 #include "overlay_dxgi_proxy.h"
 #include "overlay_native.h"
 #include "overlay_platform.h"
@@ -33,14 +34,6 @@ bool SystemDxgi(HMODULE& image) noexcept {
     return image && GetSystemDirectoryW(expected,MAX_PATH)
         && !wcscat_s(expected,L"\\dxgi.dll")
         && GetModuleFileNameW(image,actual,MAX_PATH) && !_wcsicmp(expected,actual);
-}
-bool MitigationsSupported() noexcept {
-    PROCESS_MITIGATION_CONTROL_FLOW_GUARD_POLICY cfg{};
-    PROCESS_MITIGATION_USER_SHADOW_STACK_POLICY cet{};
-    return GetProcessMitigationPolicy(GetCurrentProcess(),ProcessControlFlowGuardPolicy,&cfg,sizeof(cfg))
-        && GetProcessMitigationPolicy(GetCurrentProcess(),ProcessUserShadowStackPolicy,&cet,sizeof(cet))
-        && !cfg.StrictMode && !cfg.EnableXfg && !cet.EnableUserShadowStackStrictMode
-        && !cet.BlockNonCetBinaries && !cet.BlockNonCetBinariesNonEhcont;
 }
 bool Current(const Binding& b) noexcept {
     return b.target && b.relay && !memcmp(b.target,b.published.data(),b.published.size())
@@ -103,7 +96,7 @@ void Observe(IUnknown* object) noexcept {
     ComPtr<IDXGIAdapter> adapter;
     if (FAILED(object->QueryInterface(IID_PPV_ARGS(&adapter)))||!adapter) return;
     HMODULE dxgi=nullptr;
-    if (!SystemDxgi(dxgi)||!native::SystemDxgiObject(adapter.Get(),9)||!MitigationsSupported()) return;
+    if (!SystemDxgi(dxgi)||!native::SystemDxgiObject(adapter.Get(),9)||!HookMitigationsSupported()) return;
     void* target=(*reinterpret_cast<void***>(adapter.Get()))[6];
     if (!slots::ImageEntry(dxgi,target)) return;
     HMODULE pinned=nullptr;

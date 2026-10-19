@@ -1,9 +1,7 @@
 #include "ampere_backend.h"
 #include "fault_capture.h"
 #include "ngx_runtime_dispatch.h"
-#if MFG_UNLOCK_RUNTIME_GPU_SELECTION
 #include "gpu_dispatch.h"
-#endif
 #include "ampere_patterns.h"
 #include "ampere_provider_arch.h"
 #include "adapter_discovery.h"
@@ -1021,7 +1019,6 @@ template<size_t I> __declspec(noinline) bool Preset(uint32_t setting, uint32_t* 
     return result;
 }
 
-#if MFG_UNLOCK_RUNTIME_GPU_SELECTION
 void ObserveCreateDevice(ID3D12GraphicsCommandList* command) noexcept
 {
     if (!command) return;
@@ -1034,7 +1031,6 @@ void ObserveCreateDevice(ID3D12GraphicsCommandList* command) noexcept
     __except (EXCEPTION_EXECUTE_HANDLER) {}
     if (device) device->Release();
 }
-#endif
 
 template<size_t I> NVSDK_NGX_Result NVSDK_CONV Create(ID3D12GraphicsCommandList* command,
     NVSDK_NGX_Feature feature, const NVSDK_NGX_Parameter* parameters, NVSDK_NGX_Handle** output)
@@ -1043,7 +1039,6 @@ template<size_t I> NVSDK_NGX_Result NVSDK_CONV Create(ID3D12GraphicsCommandList*
     const bool frameGeneration = feature == NVSDK_NGX_Feature_FrameGeneration;
     if (frameGeneration) gPipelineCreateObserved.store(true, std::memory_order_release);
     auto original = RouteOriginal<CreateFn>(gRoutes[I], gRoutes[I].create);
-#if MFG_UNLOCK_RUNTIME_GPU_SELECTION
     // The command list identifies the actual device even when a game does not
     // expose slSetD3DDevice. No backend is chosen by GPU name or enumeration order.
     if (frameGeneration) ObserveCreateDevice(command);
@@ -1072,7 +1067,6 @@ template<size_t I> NVSDK_NGX_Result NVSDK_CONV Create(ID3D12GraphicsCommandList*
         // During pre-device startup, retain non-FG handles for Ampere's later
         // independent SR/RR pass-through. No parameter keys are used as identity.
     }
-#endif
     if (frameGeneration) gCreateAttempts.fetch_add(1, std::memory_order_relaxed);
     if (!original)
     {
@@ -1228,7 +1222,6 @@ template<size_t I> NVSDK_NGX_Result NVSDK_CONV Evaluate(ID3D12GraphicsCommandLis
     std::unique_lock lock(gCalls);
     auto original = RouteOriginal<EvaluateFn>(gRoutes[I], gRoutes[I].evaluate);
     if (!original) return NVSDK_NGX_Result_FAIL_NotInitialized;
-#if MFG_UNLOCK_RUNTIME_GPU_SELECTION
     if (!gpu_dispatch::IsAmpere())
     {
         if (gpu_dispatch::Selected() == gpu_dispatch::Family::eConflict) return kRejected;
@@ -1243,7 +1236,6 @@ template<size_t I> NVSDK_NGX_Result NVSDK_CONV Evaluate(ID3D12GraphicsCommandLis
         call.Complete(static_cast<uint32_t>(result));
         return result;
     }
-#endif
     const uintptr_t handleValue = reinterpret_cast<uintptr_t>(handle);
     size_t frameGenerationSlot = SIZE_MAX;
     {
@@ -1387,7 +1379,6 @@ template<size_t I> NVSDK_NGX_Result NVSDK_CONV Release(NVSDK_NGX_Handle* handle)
 {
     std::unique_lock lock(gCalls);
     auto original = RouteOriginal<ReleaseFn>(gRoutes[I], gRoutes[I].release);
-#if MFG_UNLOCK_RUNTIME_GPU_SELECTION
     // ReadSnapshot().current re-checks the entry's first bytes and can read stale while the hook is live; returning here would skip NVIDIA's release and leak the feature's VRAM.
     if (!original && !gpu_dispatch::IsAmpere())
     {
@@ -1395,10 +1386,8 @@ template<size_t I> NVSDK_NGX_Result NVSDK_CONV Release(NVSDK_NGX_Handle* handle)
         if (state.installed && state.original && state.owner == gRoutes[I].module)
             original = reinterpret_cast<ReleaseFn>(state.original);
     }
-#endif
     if (!original) return NVSDK_NGX_Result_FAIL_NotInitialized;
     const uintptr_t handleValue = reinterpret_cast<uintptr_t>(handle);
-#if MFG_UNLOCK_RUNTIME_GPU_SELECTION
     if (!gpu_dispatch::IsAmpere())
     {
         OtherFeatureLease lease{};
@@ -1429,7 +1418,6 @@ template<size_t I> NVSDK_NGX_Result NVSDK_CONV Release(NVSDK_NGX_Handle* handle)
         }
         return result;
     }
-#endif
     Route& route = gRoutes[I];
     for (auto& f : route.features)
     {
@@ -1485,7 +1473,6 @@ bool WINAPI ProviderGate(void* arg1, uintptr_t arg2, const void* arg3, void* arg
     if (attemptedEntry.current && attemptedEntry.kind == entry_detour::Kind::eNgxD3D12CreateFeature
         && arg2 == NVSDK_NGX_Feature_FrameGeneration)
         gPipelineCreateObserved.store(true, std::memory_order_release);
-#if MFG_UNLOCK_RUNTIME_GPU_SELECTION
     std::unique_lock callLock(gCalls);
     const auto selectedEntry = entry_detour::ReadSnapshot(entry);
     if (selectedEntry.kind == entry_detour::Kind::eNgxD3D12CreateFeature
@@ -1519,7 +1506,6 @@ bool WINAPI ProviderGate(void* arg1, uintptr_t arg2, const void* arg3, void* arg
         fault_capture::ProviderForward(entry, caller, arg1, arg2, arg3);
         return true;
     }
-#endif
     // Tail forwarding keeps NVIDIA's real runtime caller on the stack.
     // Only a nested call belonging to our tracked runtime operation is admitted.
     HMODULE callerModule = nullptr;
@@ -1590,9 +1576,7 @@ template<size_t I> NVSDK_NGX_Result NVSDK_CONV Requirements(IDXGIAdapter* adapte
     // Verify only the adapter supplied to this FG query. Actual device LUID
     // confirmation remains mandatory before program publication and Create.
     const bool scoped =
-#if MFG_UNLOCK_RUNTIME_GPU_SELECTION
         !gpu_dispatch::IsAda() && gpu_dispatch::Selected() != gpu_dispatch::Family::eConflict &&
-#endif
         (gInitDepth || gStartupDepth) && requirements && discovery
         && discovery->FeatureID == NVSDK_NGX_Feature_FrameGeneration
         && ampere_gpu::ObserveAdapter(adapter) && !gFatal.load();
@@ -1693,9 +1677,7 @@ template<size_t I> NVSDK_NGX_Result NVSDK_CONV Parameters(NVSDK_NGX_Parameter** 
     if (!original) return NVSDK_NGX_Result_FAIL_NotInitialized;
     const bool publishStartup = output && gStartupDepth
         && ampere_gpu::Ready() && AdapterVerified() && !gFatal.load()
-#if MFG_UNLOCK_RUNTIME_GPU_SELECTION
         && gpu_dispatch::IsAmpere()
-#endif
         ;
     if (!publishStartup)
     {
@@ -2416,9 +2398,7 @@ void BeginInit() noexcept
     // Remember the depth that acquired a persistent Ampere lock: selection can
     // change inside slInit, and nested scopes must unwind the original owner.
     if (!gInitLockDepth
-#if MFG_UNLOCK_RUNTIME_GPU_SELECTION
         && gpu_dispatch::IsAmpere()
-#endif
         )
     {
         gCalls.lock();
@@ -2528,14 +2508,12 @@ bool InspectRuntimeLayout(Route& route, const Image&, const wchar_t* path) noexc
 void ObserveModule(HMODULE module, const wchar_t* path, uint64_t generation,
     bool wrapper, bool provider, bool runtime) noexcept
 {
-#if MFG_UNLOCK_RUNTIME_GPU_SELECTION
     // Streamline can probe, unload and replace plugins during slInit, before
     // the device establishes the GPU family. Pinning a probe wrapper here can
     // preserve its pointers into a common plugin which the host then unloads.
     // Confirm Ampere before claiming routes or retaining any discovery owner.
     // BeginStartup re-inspects the surviving modules after device selection.
     if (!gpu_dispatch::IsAmpere()) return;
-#endif
     if (!module || !generation || (!wrapper && !provider && !runtime) || gFatal.load()) return;
     std::lock_guard callLock(gCalls);
     std::lock_guard lock(gInstall);
@@ -2632,13 +2610,11 @@ bool InstallRoute(HMODULE module, const wchar_t* path, uint64_t generation, bool
     std::lock_guard callLock(gCalls);
     std::lock_guard lock(gInstall);
     if (!module || !generation) return false;
-#if MFG_UNLOCK_RUNTIME_GPU_SELECTION
     // Provider entry routes serve both GPUs: RTX 40 keeps the shared eligibility (310.9.16 included),
     // RTX 30 its own (Ada-only builds excluded).
     if (!runtime && !(gpu_dispatch::IsAda()
             ? dlssg_provider_policy::IsSupportedProvider(module, path)
             : dlssg_provider_policy::IsSupportedAmpereProvider(module, path))) return false;
-#endif
     auto* route = FindRoute(module, generation);
     if (!route) return false;
     route->runtime = runtime;
@@ -2647,9 +2623,7 @@ bool InstallRoute(HMODULE module, const wchar_t* path, uint64_t generation, bool
     // that runtime is absent, startup and provider admission still fail closed.
     // Selected Ada callbacks are native pass-throughs and need no Ampere layout.
     if (runtime
-#if MFG_UNLOCK_RUNTIME_GPU_SELECTION
         && !gpu_dispatch::IsAda()
-#endif
         )
     {
         Image image{};

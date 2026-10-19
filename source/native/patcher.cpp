@@ -1,18 +1,14 @@
-#if defined(MFG_UNLOCK_SINGLE_MODULE_UI)
 #include "single_module.h"
 #include "single_overlay.h"
 #include "overlay_application_imports.h"
 #include "overlay_slots.h"
 #include "caller_scoped_import.h"
-#endif
 #include "shared.h"
 #include "build_variant.h"
 #include "unified_control_paths.h"
 #include "status_transport.h"
 #include "ui_status_json.h"
 #include "ui_input_coherence.h"
-#include "hudless_probe.h"
-#include "hudless_visualizer.h"
 #if MFG_UNLOCK_XESS
 #include "xess/xess_mod.h"
 #endif
@@ -27,9 +23,6 @@
 #include "gpu_selection_policy.h"
 #include "midpoint_fix.h"
 #include "early_provider_load.h"
-#include "output_pull_experiment.h"
-#include "prev2curr_experiment.h"
-#include "output_pull_telemetry.h"
 namespace gpu_backend = gpu_dispatch;
 inline bool UseAmpere() noexcept { return gpu_dispatch::IsAmpere(); }
 
@@ -48,7 +41,6 @@ inline bool UseAmpere() noexcept { return gpu_dispatch::IsAmpere(); }
 #include "entry_detour.h"
 #include "protected_pointer.h"
 #include "nvidia_mfg_policy.h"
-#include "selective_ota_wrapper_policy.h"
 #include "streamline_ota_policy.h"
 #include "temporal_interval_trace.h"
 #include "fault_capture.h"
@@ -170,16 +162,6 @@ std::atomic<uint32_t> gStreamlineHostVersionMajor{0};
 std::atomic<uint32_t> gStreamlineHostVersionMinor{0};
 std::atomic<uint32_t> gStreamlineHostVersionBuild{0};
 std::atomic<uint32_t> gStreamlineHostVersionPrivate{0};
-std::atomic<bool> gSelectiveOtaDlssgWrapperRequested{false};
-std::atomic<bool> gSelectiveOtaDlssgWrapperCandidateReady{false};
-std::atomic<uint32_t> gSelectiveOtaDlssgWrapperFailure{0};
-std::atomic<uint64_t> gSelectiveOtaDlssgWrapperRedirectAttempts{0};
-std::atomic<uint64_t> gSelectiveOtaDlssgWrapperRedirectSuccesses{0};
-std::atomic<uint64_t> gSelectiveOtaDlssgWrapperFallbacks{0};
-std::atomic<uint32_t> gSelectiveOtaDlssgWrapperVersionMajor{0};
-std::atomic<uint32_t> gSelectiveOtaDlssgWrapperVersionMinor{0};
-std::atomic<uint32_t> gSelectiveOtaDlssgWrapperVersionBuild{0};
-std::atomic<uint32_t> gSelectiveOtaDlssgWrapperVersionPrivate{0};
 std::atomic<bool> gSetOptionsHookExposed{false};
 std::atomic<bool> gGetStateHookExposed{false};
 std::atomic<bool> gSetOptionsSeen{false};
@@ -321,14 +303,12 @@ std::mutex gModuleMutex;
 std::mutex gImportPublicationMutex;
 std::mutex gActiveControlRouteMutex;
 std::mutex gUiTagMutex;
-std::mutex gSelectiveOtaDlssgWrapperMutex;
 std::once_flag gNvidiaCompatibilityOnce;
 std::wstring gConfigPath;
 std::wstring gStatusPath;
 std::wstring gExecutableDirectory;
 std::wstring gExecutablePath;
 std::array<wchar_t, 32768> gExecutablePathBuffer{};
-std::wstring gSelectiveOtaDlssgWrapperPath;
 std::string gNvidiaProfileName;
 
 constexpr uint32_t kRouteLocal = 1u;
@@ -351,15 +331,6 @@ entry_detour::Handle UnpackEntryHandle(uint64_t value) noexcept
         static_cast<uint32_t>(value >> 32)};
 }
 
-enum class SelectiveOtaDlssgWrapperFailure : uint32_t
-{
-    eNone = 0,
-    eProviderUnsupported = 1,
-    eLoaderDiscoveryUnavailable = 2,
-    eProgramDataUnavailable = 3,
-    eNoCompatibleCandidate = 4,
-};
-
 struct ControlConfig
 {
     bool followGame = true;
@@ -377,7 +348,6 @@ struct ControlConfig
     bool dynamicExperimental56 = false;
     bool generatedOnlyDebug = false;
     bool intervalLogging = gpu_dispatch::IsAda() || UseAmpere();
-    bool selectiveOtaDlssgWrapper = false;
     // When OptiScaler is detected: 0 = its menu owns the controls (RTXMFG UI
     // hidden, Follow, no overrides); 1 = "rtxmfg" keeps RTXMFG's UI/controls.
     uint32_t optiScalerUi = 0;
@@ -620,10 +590,6 @@ sl::Result InvokeAmpereInit(PFun_slInit* original, const sl::Preferences& prefer
     __finally { ampere_backend::EndInit(); }
 }
 
-void ConfigureSelectiveOtaDlssgWrapper(bool requested,
-    bool providerSupported, bool loaderDiscoveryReady);
-std::wstring SelectiveOtaDlssgWrapperRedirectPath(
-    const std::wstring& requestedPath);
 sl::Result HookSlDLSSGGetState(const sl::ViewportHandle& viewport,
     sl::DLSSGState& state, const sl::DLSSGOptions* options);
 ModuleRecord InspectLoadedModule(
@@ -1079,18 +1045,6 @@ void UpdateFpsTelemetryWithoutPresentCallback()
             realFrames = std::max(realFrames, current - previous);
     }
 
-#if !defined(MFG_UNLOCK_SINGLE_MODULE_UI)
-    uint32_t presentedMultiplier = gActualFramesPresented.load(
-        std::memory_order_relaxed);
-    if (presentedMultiplier < kMinimumMultiplier
-        && intervalTrace.lastCount >= 1 && intervalTrace.lastCount <= 5)
-    {
-        presentedMultiplier = static_cast<uint32_t>(
-            intervalTrace.lastCount + 1);
-    }
-    presentedMultiplier = std::clamp(
-        presentedMultiplier, kMinimumMultiplier, kMaximumMultiplier);
-#endif
     const uint64_t frequency = static_cast<uint64_t>(
         gFpsCounterFrequency.QuadPart);
     const auto rateMilli = [&](uint64_t frames) {
@@ -1098,16 +1052,10 @@ void UpdateFpsTelemetryWithoutPresentCallback()
             (frames * frequency * 1000u + elapsedTicks / 2u) / elapsedTicks));
     };
     gRealFpsMilli.store(rateMilli(realFrames), std::memory_order_relaxed);
-#if defined(MFG_UNLOCK_SINGLE_MODULE_UI)
     // The selected mode and the latest GetState result are not output counts
     // for this time window. Keep the real rate if DXGI telemetry is unavailable.
     gDlssFpsMilli.store(0, std::memory_order_relaxed);
     gFpsOutputSource.store(0, std::memory_order_relaxed);
-#else
-    gDlssFpsMilli.store(rateMilli(realFrames * presentedMultiplier),
-        std::memory_order_relaxed);
-    gFpsOutputSource.store(3, std::memory_order_relaxed);
-#endif
     gFpsSampleWindowMs.store(static_cast<uint32_t>(
         std::min<uint64_t>(UINT32_MAX,
             (elapsedTicks * 1000u + frequency / 2u) / frequency)),
@@ -1515,17 +1463,17 @@ bool TryParseControl(const char* data, size_t size, ControlConfig& control)
             parsed.generatedOnlyDebug))
         return false;
 
+    // Protocol 18 retired single-wrapper redirection. Keep accepting the old
+    // key so existing configs migrate without being rejected; it is ignored.
     size_t selectiveWrapperOffset = 0;
+    bool selectiveWrapperIgnored = false;
     if (FindJsonValue(content, "selectiveOtaDlssgWrapper",
             selectiveWrapperOffset)
         && !TryParseBoolean(content, "selectiveOtaDlssgWrapper",
-            parsed.selectiveOtaDlssgWrapper))
+            selectiveWrapperIgnored))
     {
         return false;
     }
-    // Protocol 18 retires single-wrapper redirection. Keep accepting the old
-    // key so existing configs migrate without being rejected, but never arm it.
-    parsed.selectiveOtaDlssgWrapper = false;
 
     size_t optiScalerUiOffset = 0;
     if (FindJsonValue(content, "optiScalerUi", optiScalerUiOffset))
@@ -1588,7 +1536,6 @@ ControlConfig ReadInitialControl()
     if (ReadControlFile(gConfigPath, fileControl))
         return fileControl;
 
-#if defined(MFG_UNLOCK_UNIVERSAL_CONFIG)
     // A dedicated CET install keeps its live control inside CET's mandatory
     // per-mod filesystem sandbox. Preserve an existing executable-side choice
     // as the first-launch fallback; the next CET selection is written to the
@@ -1600,7 +1547,6 @@ ControlConfig ReadInitialControl()
     {
         return fileControl;
     }
-#endif
     return control;
 }
 
@@ -1632,89 +1578,17 @@ uint32_t ReadInitialDlssgPreset() noexcept
     catch (...) { return optiscaler_host::UiDelegated() ? dlssg_preset::kGameOrDriver : 2; }
 }
 
-std::wstring ResolveConfigPath(HMODULE instance, const std::wstring& executableDirectory)
+std::wstring ResolveConfigPath(HMODULE, const std::wstring& executableDirectory)
 {
-#if MFG_UNLOCK_RUNTIME_GPU_SELECTION
     // The integrated UI owns this transport; an old CET script is not a
     // consumer of the unified filenames and must not redirect the worker.
     return unified_control_paths::Config(executableDirectory);
-#endif
-    if (UseAmpere())
-    {
-        return JoinPath(executableDirectory, MFG_CONFIG_W);
-    }
-    std::wstring explicitPath(32768, L'\0');
-    const DWORD explicitLength = GetEnvironmentVariableW(
-        MFG_CONFIG_ENV_W, explicitPath.data(),
-        static_cast<DWORD>(explicitPath.size()));
-    if (explicitLength > 0 && explicitLength < explicitPath.size())
-    {
-        explicitPath.resize(explicitLength);
-        return explicitPath;
-    }
-
-#if defined(MFG_UNLOCK_UNIVERSAL_CONFIG)
-#if !(MFG_UNLOCK_OUTPUT_PULL_EXPERIMENT || MFG_UNLOCK_OUTPUT_PULL_TELEMETRY)
-    // The isolated OutputPull builds pair with the executable-side ReShade UI.
-    // Preserve the stock CET autodetection only outside this experiment.
-    const std::wstring cetDirectory = JoinPath(executableDirectory,
-        L"plugins\\cyber_engine_tweaks\\mods\\RTX40MFG");
-    if (IsRegularFile(JoinPath(cetDirectory, L"init.lua")))
-    {
-        return JoinPath(cetDirectory, MFG_CONFIG_W);
-    }
-#endif
-    return JoinPath(executableDirectory, MFG_CONFIG_W);
-#else
-    const std::wstring cetPath = JoinPath(executableDirectory,
-        L"plugins\\cyber_engine_tweaks\\mods\\RTX40MFG\\config.json");
-    if (IsRegularFile(cetPath))
-        return cetPath;
-
-    std::wstring modulePath(32768, L'\0');
-    const DWORD moduleLength = GetModuleFileNameW(instance,
-        modulePath.data(), static_cast<DWORD>(modulePath.size()));
-    modulePath.resize(moduleLength < modulePath.size() ? moduleLength : 0);
-    const std::wstring legacyPath = JoinPath(
-        ParentPath(ParentPath(modulePath)), L"config.json");
-    return IsRegularFile(legacyPath) ? legacyPath : cetPath;
-#endif
 }
 
 std::wstring ResolveStatusPath(const std::wstring& configPath,
     const std::wstring& executableDirectory)
 {
-#if MFG_UNLOCK_RUNTIME_GPU_SELECTION
     return unified_control_paths::Status(configPath, executableDirectory);
-#endif
-    if (UseAmpere())
-    {
-        return JoinPath(executableDirectory, MFG_STATUS_W);
-    }
-    std::wstring explicitPath(32768, L'\0');
-    const DWORD explicitLength = GetEnvironmentVariableW(
-        MFG_STATUS_ENV_W, explicitPath.data(),
-        static_cast<DWORD>(explicitPath.size()));
-    if (explicitLength > 0 && explicitLength < explicitPath.size())
-    {
-        explicitPath.resize(explicitLength);
-        return explicitPath;
-    }
-
-#if defined(MFG_UNLOCK_UNIVERSAL_CONFIG)
-    const std::wstring universalConfig = JoinPath(
-        executableDirectory, MFG_CONFIG_W);
-    const std::wstring cetConfig = JoinPath(executableDirectory,
-        L"plugins\\cyber_engine_tweaks\\mods\\RTX40MFG\\"
-        MFG_CONFIG_W);
-    if (_wcsicmp(configPath.c_str(), universalConfig.c_str()) == 0
-        || _wcsicmp(configPath.c_str(), cetConfig.c_str()) == 0)
-    {
-        return JoinPath(ParentPath(configPath),
-            MFG_STATUS_W);
-    }
-#endif
-    return JoinPath(ParentPath(configPath), L"bridge_status.json");
 }
 
 uint64_t StoreControl(const ControlConfig& control)
@@ -2283,16 +2157,6 @@ bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
         "\"otaPreferencesForced\":%s,\"otaPreferencesEnabledAtInit\":%s,"
         "\"downloadedStreamlinePluginsEnabledAtInit\":%s,"
         "\"otaProviderPreflightSupported\":%s,\"otaForceSuppressed\":%s,"
-        "\"selectiveOtaDlssgWrapperRequested\":%s,"
-        "\"selectiveOtaDlssgWrapperCandidateReady\":%s,"
-        "\"selectiveOtaDlssgWrapperFailure\":%u,"
-        "\"selectiveOtaDlssgWrapperRedirectAttempts\":%llu,"
-        "\"selectiveOtaDlssgWrapperRedirectSuccesses\":%llu,"
-        "\"selectiveOtaDlssgWrapperFallbacks\":%llu,"
-        "\"selectiveOtaDlssgWrapperVersionMajor\":%u,"
-        "\"selectiveOtaDlssgWrapperVersionMinor\":%u,"
-        "\"selectiveOtaDlssgWrapperVersionBuild\":%u,"
-        "\"selectiveOtaDlssgWrapperVersionPrivate\":%u,"
         "\"slCommonResolverDiscoveryInstalled\":%s,"
         "\"streamlineLoaderDiscoveryInstalled\":%s,"
         "\"streamlineLoaderDiscoveryCalls\":%llu,"
@@ -2474,29 +2338,6 @@ bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
             std::memory_order_relaxed) ? "true" : "false",
         gOtaForceSuppressed.load(
             std::memory_order_relaxed) ? "true" : "false",
-        gSelectiveOtaDlssgWrapperRequested.load(
-            std::memory_order_relaxed) ? "true" : "false",
-        gSelectiveOtaDlssgWrapperCandidateReady.load(
-            std::memory_order_relaxed) ? "true" : "false",
-        gSelectiveOtaDlssgWrapperFailure.load(
-            std::memory_order_relaxed),
-        static_cast<unsigned long long>(
-            gSelectiveOtaDlssgWrapperRedirectAttempts.load(
-                std::memory_order_relaxed)),
-        static_cast<unsigned long long>(
-            gSelectiveOtaDlssgWrapperRedirectSuccesses.load(
-                std::memory_order_relaxed)),
-        static_cast<unsigned long long>(
-            gSelectiveOtaDlssgWrapperFallbacks.load(
-                std::memory_order_relaxed)),
-        gSelectiveOtaDlssgWrapperVersionMajor.load(
-            std::memory_order_relaxed),
-        gSelectiveOtaDlssgWrapperVersionMinor.load(
-            std::memory_order_relaxed),
-        gSelectiveOtaDlssgWrapperVersionBuild.load(
-            std::memory_order_relaxed),
-        gSelectiveOtaDlssgWrapperVersionPrivate.load(
-            std::memory_order_relaxed),
         gSlCommonResolverDiscoveryInstalled.load(
             std::memory_order_relaxed) ? "true" : "false",
         gStreamlineLoaderDiscoveryInstalled.load(
@@ -2717,7 +2558,6 @@ bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
     serialized.insert(serialized.rfind('}'), pacing);
     serialized.insert(serialized.rfind('}'), XessStatusFragment(control));
     serialized.insert(serialized.rfind('}'), OptiScalerStatusFragment());
-    serialized.insert(serialized.rfind('}'), hudless_probe::StatusFragment());
     // Flat fields only (ampere_status_fields.h): nested objects made the menu
     // reject every RTX 30 status snapshot.
     if (const auto declaration = ampere_provider_arch::Read(); declaration.armed)
@@ -3603,14 +3443,6 @@ bool GameEnablesUiRecomposition(const sl::DLSSGOptions& source) noexcept
         && source.enableUserInterfaceRecomposition == sl::Boolean::eTrue;
 }
 
-// UI recomposition is left to the game: RTXMFG never changes the option and
-// never tags a UI buffer. HUDless detection only reports the game's choice.
-void ReportUiRecomposition(const sl::DLSSGOptions& source) noexcept
-{
-    hudless_probe::ReportRecomposition(GameEnablesUiRecomposition(source)
-        ? hudless_probe::RecompositionState::eGameManaged : hudless_probe::RecompositionState::eOff);
-}
-
 sl::DLSSGOptions BuildAdjustedOptions(
     const sl::DLSSGOptions& source, const ControlSnapshot& snapshot,
     bool preserveNext)
@@ -3661,7 +3493,6 @@ sl::DLSSGOptions BuildAdjustedOptions(
             | static_cast<uint32_t>(
                 sl::DLSSGFlags::eShowOnlyInterpolatedFrame));
     }
-    ReportUiRecomposition(source);
     return adjusted;
 }
 
@@ -4577,13 +4408,6 @@ void BeforeNgxCreateFeatureForRoute(NgxDispatchRoute route,
         }
     }
 #endif
-#if (MFG_UNLOCK_OUTPUT_PULL_EXPERIMENT || MFG_UNLOCK_OUTPUT_PULL_TELEMETRY)
-    const bool outputPullReady = ready && api == NgxGraphicsApi::eD3D12
-        && midpoint_fix::PrepareOutputPullForCreate(provider, path.c_str());
-    const bool prev2CurrReady = outputPullReady
-        && midpoint_fix::PreparePrev2CurrForCreate(provider, path.c_str());
-    output_pull_telemetry::RecordCreate(outputPullReady, prev2CurrReady);
-#endif
     gBackportReadyAtCreate.store(ready, std::memory_order_release);
     if (firstPipelineCreate)
         gFirstCreateMidpointReady.store(ready, std::memory_order_release);
@@ -4778,9 +4602,6 @@ void BeforeNgxEvaluateFeatureForRoute(NgxDispatchRoute route,
         }
         gNgxEvaluateCalls.fetch_add(1, std::memory_order_relaxed);
     }
-#if MFG_UNLOCK_OUTPUT_PULL_TELEMETRY
-    output_pull_telemetry::RecordEvaluate(handle);
-#endif
 }
 
 void WINAPI BeforeNgxD3D12EvaluateFeature(void* commandList,
@@ -5286,7 +5107,6 @@ sl::Result PassPublicSet(ControlRouteRecord& route,
 sl::Result PassPublicSetBeforeControl(ControlRouteRecord& route,
     const sl::ViewportHandle& viewport, const sl::DLSSGOptions& options) noexcept
 {
-    ReportUiRecomposition(options);
     return PassPublicSet(route, viewport, options);
 }
 
@@ -5555,7 +5375,6 @@ sl::Result HandleInternalSetData(uint32_t routeSlot,
     CaptureGameOptions(publicViewport, source);
     // As PassPublicSetBeforeControl: the game's options pass through unchanged.
     const auto passThroughBeforeControl = [&]() {
-        ReportUiRecomposition(source);
         return passThrough();
     };
     if (!gControlReady.load(std::memory_order_acquire)
@@ -6215,108 +6034,6 @@ uint32_t ResolvedDlssgControlRoute(void* resolved)
     return EnsureControlRoute(owner, discovered.path, discovered.generation, false, 0);
 }
 
-// PCL markers (and the older Reflex entry with the same ABI and marker values)
-// tell HUDless detection which frame is being presented, so frame-indexed tags
-// can be paired with their Present. Observation only; every call is forwarded.
-using PFun_PresentMarker = sl::Result(uint32_t marker, const sl::FrameToken& frame);
-std::atomic<PFun_PresentMarker*> gOriginalPclSetMarker{nullptr};
-std::atomic<PFun_PresentMarker*> gOriginalReflexSetMarker{nullptr};
-constexpr uint32_t kPresentStartMarker = 4; // sl::PCLMarker::ePresentStart
-
-// The presented frame's token (owned by Streamline's frame ring) and the
-// viewport the game tags HUDless for; a synthesized UI buffer is tagged with them.
-std::atomic<const sl::FrameToken*> gPresentToken{nullptr};
-std::atomic<uint32_t> gPresentTokenFrame{UINT32_MAX};
-std::atomic<uint32_t> gHudlessViewport{UINT32_MAX};
-
-sl::Result ForwardPresentMarker(PFun_PresentMarker* original, uint32_t marker,
-    const sl::FrameToken& frame)
-{
-    if (!original)
-        return sl::Result::eErrorNotInitialized;
-    if (marker == kPresentStartMarker)
-    {
-        const uint32_t index = static_cast<uint32_t>(frame);
-        gPresentTokenFrame.store(index, std::memory_order_relaxed);
-        gPresentToken.store(&frame, std::memory_order_release);
-        hudless_probe::ObservePresentFrame(index);
-    }
-    return original(marker, frame);
-}
-
-// Tags RTXMFG's synthesized UI alpha for the Present of `frame` through the
-// host's own tagging route, bypassing the hooks. Games tagging per frame need
-// the presented frame's token; a mismatch is refused rather than mis-tagged.
-bool TagSynthesizedUi(void* resource, uint32_t state, uint32_t width, uint32_t height,
-    uint32_t format, uint32_t frame) noexcept
-{
-    const uint32_t viewportValue = gHudlessViewport.load(std::memory_order_acquire);
-    if (!resource || viewportValue == UINT32_MAX)
-        return false;
-    sl::Resource ui(sl::ResourceType::eTex2d, resource, state);
-    ui.width = width;
-    ui.height = height;
-    ui.nativeFormat = format;
-    ui.mipLevels = 1;
-    ui.arrayLayers = 1;
-    ui.flags = 0;
-    sl::Extent extent{};
-    extent.width = width;
-    extent.height = height;
-    sl::ResourceTag tag(&ui, sl::kBufferTypeUIAlpha, sl::ResourceLifecycle::eValidUntilPresent, &extent);
-    const sl::ViewportHandle viewport{viewportValue};
-    if (gSetTagForFrameCalls.load(std::memory_order_relaxed) != 0)
-    {
-        auto* original = gOriginalSetTagForFrame.load(std::memory_order_acquire);
-        const sl::FrameToken* token = gPresentToken.load(std::memory_order_acquire);
-        if (!original || !token || frame == hudless_probe::kNoFrame
-            || gPresentTokenFrame.load(std::memory_order_relaxed) != frame)
-            return false;
-        return original(*token, viewport, &tag, 1, nullptr) == sl::Result::eOk;
-    }
-    auto* original = gOriginalSetTag.load(std::memory_order_acquire);
-    return original && original(viewport, &tag, 1, nullptr) == sl::Result::eOk;
-}
-
-sl::Result HookSlPCLSetMarker(uint32_t marker, const sl::FrameToken& frame)
-{
-    return ForwardPresentMarker(gOriginalPclSetMarker.load(std::memory_order_acquire), marker, frame);
-}
-
-sl::Result HookSlReflexSetMarker(uint32_t marker, const sl::FrameToken& frame)
-{
-    return ForwardPresentMarker(gOriginalReflexSetMarker.load(std::memory_order_acquire), marker, frame);
-}
-
-void InterceptPresentMarker(sl::Feature feature, const char* functionName, void*& function) noexcept
-{
-    std::atomic<PFun_PresentMarker*>* original = nullptr;
-    PFun_PresentMarker* hook = nullptr;
-    if (feature == sl::kFeaturePCL && strcmp(functionName, "slPCLSetMarker") == 0)
-    {
-        original = &gOriginalPclSetMarker;
-        hook = &HookSlPCLSetMarker;
-    }
-    else if (feature == sl::kFeatureReflex && strcmp(functionName, "slReflexSetMarker") == 0)
-    {
-        original = &gOriginalReflexSetMarker;
-        hook = &HookSlReflexSetMarker;
-    }
-    else
-        return;
-    auto* resolved = reinterpret_cast<PFun_PresentMarker*>(function);
-    if (resolved == hook)
-        return;
-    PFun_PresentMarker* expected = nullptr;
-    if (!original->compare_exchange_strong(expected, resolved, std::memory_order_acq_rel)
-        && expected != resolved)
-        return; // Another implementation is already bound; leave this one untouched.
-    function = reinterpret_cast<void*>(hook);
-    static std::atomic<bool> logged[2]{};
-    if (!logged[hook == &HookSlPCLSetMarker ? 0 : 1].exchange(true, std::memory_order_relaxed))
-        Log(L"Present marker observer installed: %hs", functionName);
-}
-
 sl::Result HookSlGetFeatureFunction(
     sl::Feature feature, const char* functionName, void*& function)
 {
@@ -6329,8 +6046,6 @@ sl::Result HookSlGetFeatureFunction(
         InspectAlreadyLoadedModules();
 
     const sl::Result result = original(feature, functionName, function);
-    if (result == sl::Result::eOk && function && functionName)
-        InterceptPresentMarker(feature, functionName, function);
     if (result != sl::Result::eOk || feature != sl::kFeatureDLSS_G)
         return result;
     if (function && functionName && strcmp(functionName, "slDLSSGSetOptions") == 0)
@@ -6423,84 +6138,11 @@ void LogFirstTagOfType(const sl::ResourceTag& tag, bool framed, bool hasList) no
         resource ? resource->width : 0u, resource ? resource->height : 0u);
 }
 
-// Copies bounded tag metadata for HUDless detection. Resource fields are read
-// only from structures with the Streamline identity; versions are append-only,
-// so any version from the first onward shares these fields.
-void ObserveHudlessDetectionTags(const sl::ResourceTag* tags, uint32_t numTags,
-    sl::CommandBuffer* cmdBuffer, bool framed, uint32_t frame = hudless_probe::kNoFrame) noexcept
+void LogFirstTags(const sl::ResourceTag* tags, uint32_t numTags, bool framed,
+    bool hasList) noexcept
 {
-    if (!tags || !numTags || numTags > 1024) return;
-    std::array<hudless_probe::Tag, 64> copies{};
-    const uint32_t count = std::min<uint32_t>(numTags, static_cast<uint32_t>(copies.size()));
-    for (uint32_t index = 0; index < count; ++index)
-    {
-        const auto& tag = tags[index];
-        auto& copy = copies[index];
-        copy.type = tag.type;
-        // Same presence test as the established UI-tag observer.
-        copy.present = tag.resource && tag.resource->native;
-        LogFirstTagOfType(tag, framed, cmdBuffer != nullptr);
-        if (tag.structType != sl::ResourceTag::s_structType
-            || tag.structVersion < sl::kStructVersion1)
-            continue;
-        copy.lifecycle = static_cast<uint32_t>(tag.lifecycle);
-        copy.extentLeft = tag.extent.left;
-        copy.extentTop = tag.extent.top;
-        copy.extentWidth = tag.extent.width;
-        copy.extentHeight = tag.extent.height;
-        const auto* resource = tag.resource;
-        if (!resource || !resource->native) continue;
-        // Unreal's Streamline plugin fills native/state but leaves the
-        // Resource header zero. Streamline consumes those fields from a
-        // verified tag, so the same fields are trusted here; description
-        // fields are used only when the header identifies an sl::Resource.
-        const bool resourceHeader = resource->structType == sl::Resource::s_structType
-            && resource->structVersion >= sl::kStructVersion1;
-        copy.native = resource->native;
-        copy.state = resource->state;
-        copy.nativeFormat = resourceHeader ? resource->nativeFormat : 0u;
-        copy.width = resourceHeader ? resource->width : 0u;
-        copy.height = resourceHeader ? resource->height : 0u;
-        copy.described = resource->type == sl::ResourceType::eTex2d;
-    }
-    hudless_probe::ObserveTags(copies.data(), count, cmdBuffer, framed, frame);
-}
-
-// Test hosts only (RTXMFG_TEST_HIDE_GAME_UI=1): withholds the host's UI buffer
-// tags from Streamline and detection so the synthesized-UI route can be
-// exercised with a real provider. Opt-in only.
-bool TestHidesGameUi() noexcept
-{
-    static const bool enabled = [] {
-        wchar_t value[4]{};
-        return GetEnvironmentVariableW(L"RTXMFG_TEST_HIDE_GAME_UI", value, 4) == 1
-            && value[0] == L'1';
-    }();
-    return enabled;
-}
-
-const sl::ResourceTag* WithoutHostUi(const sl::ResourceTag* tags, uint32_t& count,
-    std::vector<sl::ResourceTag>& storage)
-{
-    if (!TestHidesGameUi() || !tags || count > 1024)
-        return tags;
-    storage.clear();
-    for (uint32_t index = 0; index < count; ++index)
-        if (tags[index].type != sl::kBufferTypeUIAlpha && tags[index].type != sl::kBufferTypeUIColorAndAlpha)
-            storage.push_back(tags[index]);
-    count = static_cast<uint32_t>(storage.size());
-    return storage.data();
-}
-
-void RecordHudlessViewport(const sl::ViewportHandle& viewport, const sl::ResourceTag* tags,
-    uint32_t count) noexcept
-{
-    for (uint32_t index = 0; tags && index < count && index < 1024; ++index)
-        if (tags[index].type == sl::kBufferTypeHUDLessColor)
-        {
-            gHudlessViewport.store(static_cast<uint32_t>(viewport), std::memory_order_release);
-            return;
-        }
+    for (uint32_t index = 0; tags && index < numTags && index < 1024; ++index)
+        LogFirstTagOfType(tags[index], framed, hasList);
 }
 
 sl::Result HookSlSetTag(const sl::ViewportHandle& viewport,
@@ -6509,8 +6151,6 @@ sl::Result HookSlSetTag(const sl::ViewportHandle& viewport,
     auto* original = gOriginalSetTag.load(std::memory_order_acquire);
     if (!original)
         return sl::Result::eErrorNotInitialized;
-    std::vector<sl::ResourceTag> visible;
-    tags = WithoutHostUi(tags, numTags, visible);
     if (!numTags)
         return sl::Result::eOk;
     const auto batch = PrepareUiResourceTags(viewport, tags, numTags, false, 0);
@@ -6519,8 +6159,7 @@ sl::Result HookSlSetTag(const sl::ViewportHandle& viewport,
     if (result == sl::Result::eOk)
     {
         RecordUiResourceTags(batch);
-        RecordHudlessViewport(viewport, tags, numTags);
-        ObserveHudlessDetectionTags(tags, numTags, cmdBuffer, false);
+        LogFirstTags(tags, numTags, false, cmdBuffer != nullptr);
     }
     return result;
 }
@@ -6532,8 +6171,6 @@ sl::Result HookSlSetTagForFrame(const sl::FrameToken& frame,
     auto* original = gOriginalSetTagForFrame.load(std::memory_order_acquire);
     if (!original)
         return sl::Result::eErrorNotInitialized;
-    std::vector<sl::ResourceTag> visible;
-    tags = WithoutHostUi(tags, numTags, visible);
     if (!numTags)
         return sl::Result::eOk;
     const auto batch = PrepareUiResourceTags(viewport, tags, numTags, true,
@@ -6543,8 +6180,7 @@ sl::Result HookSlSetTagForFrame(const sl::FrameToken& frame,
     if (result == sl::Result::eOk)
     {
         RecordUiResourceTags(batch);
-        RecordHudlessViewport(viewport, tags, numTags);
-        ObserveHudlessDetectionTags(tags, numTags, cmdBuffer, true, static_cast<uint32_t>(frame));
+        LogFirstTags(tags, numTags, true, cmdBuffer != nullptr);
     }
     return result;
 }
@@ -6593,10 +6229,6 @@ sl::Result HookSlSetD3DDevice(void* device)
     }
     const sl::Result result = UseAmpere()
         ? InvokeAmpereDeviceSetup(original, device) : original(device);
-    if (result == sl::Result::eOk && verifiedDevice)
-    {
-        hudless_probe::ObserveD3D12Device(device);
-    }
     return result;
 }
 
@@ -6627,7 +6259,6 @@ sl::Result HookSlSetVulkanInfo(const VulkanInfoPrefix& info)
         gModuleInventoryDirty.store(true, std::memory_order_release);
         InspectAlreadyLoadedModules();
     }
-    hudless_probe::ObserveVulkan();
     return original(info);
 }
 
@@ -6791,30 +6422,6 @@ std::string AnsiPathFromWide(const std::wstring& path)
     return result;
 }
 
-void RecordSelectiveOtaDlssgWrapperResult(
-    const std::wstring& requestedPath, const std::wstring& redirectPath,
-    HMODULE module, DWORD redirectError, bool fallback)
-{
-    gSelectiveOtaDlssgWrapperRedirectAttempts.fetch_add(
-        1, std::memory_order_relaxed);
-    if (module && !fallback)
-    {
-        gSelectiveOtaDlssgWrapperRedirectSuccesses.fetch_add(
-            1, std::memory_order_relaxed);
-        Log(L"Selective DLSS-G wrapper redirect loaded NVIDIA OTA candidate: "
-            L"requested=%s selected=%s", requestedPath.c_str(),
-            redirectPath.c_str());
-    }
-    else if (fallback)
-    {
-        gSelectiveOtaDlssgWrapperFallbacks.fetch_add(
-            1, std::memory_order_relaxed);
-        Log(L"Selective DLSS-G wrapper redirect failed (%lu); "
-            L"falling back to game wrapper: requested=%s selected=%s",
-            redirectError, requestedPath.c_str(), redirectPath.c_str());
-    }
-}
-
 void InspectStreamlineLoadedModule(HMODULE module)
 {
     if (!module)
@@ -6867,8 +6474,7 @@ HMODULE WINAPI HookStreamlineLoadLibraryA(LPCSTR fileName)
         return nullptr;
     const std::wstring requested = WidePathFromAnsi(fileName);
     const auto providerPlan = AmpereProviderLoadPlan(requested);
-    const std::wstring redirect = providerPlan ? providerPlan.path
-        : SelectiveOtaDlssgWrapperRedirectPath(requested);
+    const std::wstring redirect = providerPlan ? providerPlan.path : std::wstring{};
     HMODULE module = nullptr;
     if (!redirect.empty())
     {
@@ -6877,11 +6483,8 @@ HMODULE WINAPI HookStreamlineLoadLibraryA(LPCSTR fileName)
             module = original(redirected.c_str());
         else SetLastError(ERROR_NO_UNICODE_TRANSLATION);
         VerifySelectedProviderLoad(providerPlan, requested, module);
-        const DWORD redirectError = module ? ERROR_SUCCESS : GetLastError();
         if (!module)
             module = original(fileName);
-        if (!providerPlan) RecordSelectiveOtaDlssgWrapperResult(requested, redirect, module,
-            redirectError, redirectError != ERROR_SUCCESS);
     }
     else
     {
@@ -6899,18 +6502,14 @@ HMODULE WINAPI HookStreamlineLoadLibraryW(LPCWSTR fileName)
         return nullptr;
     const std::wstring requested = fileName ? fileName : L"";
     const auto providerPlan = AmpereProviderLoadPlan(requested);
-    const std::wstring redirect = providerPlan ? providerPlan.path
-        : SelectiveOtaDlssgWrapperRedirectPath(requested);
+    const std::wstring redirect = providerPlan ? providerPlan.path : std::wstring{};
     HMODULE module = redirect.empty() ? original(fileName)
         : original(redirect.c_str());
     if (!redirect.empty())
     {
         VerifySelectedProviderLoad(providerPlan, requested, module);
-        const DWORD redirectError = module ? ERROR_SUCCESS : GetLastError();
         if (!module)
             module = original(fileName);
-        if (!providerPlan) RecordSelectiveOtaDlssgWrapperResult(requested, redirect, module,
-            redirectError, redirectError != ERROR_SUCCESS);
     }
     InspectStreamlineLoadedModule(module);
     return module;
@@ -6925,8 +6524,7 @@ HMODULE WINAPI HookStreamlineLoadLibraryExA(
         return nullptr;
     const std::wstring requested = WidePathFromAnsi(fileName);
     const auto providerPlan = AmpereProviderLoadPlan(requested, file, flags);
-    const std::wstring redirect = providerPlan ? providerPlan.path
-        : SelectiveOtaDlssgWrapperRedirectPath(requested);
+    const std::wstring redirect = providerPlan ? providerPlan.path : std::wstring{};
     HMODULE module = nullptr;
     if (!redirect.empty())
     {
@@ -6935,11 +6533,8 @@ HMODULE WINAPI HookStreamlineLoadLibraryExA(
             module = original(redirected.c_str(), file, flags);
         else SetLastError(ERROR_NO_UNICODE_TRANSLATION);
         VerifySelectedProviderLoad(providerPlan, requested, module);
-        const DWORD redirectError = module ? ERROR_SUCCESS : GetLastError();
         if (!module)
             module = original(fileName, file, flags);
-        if (!providerPlan) RecordSelectiveOtaDlssgWrapperResult(requested, redirect, module,
-            redirectError, redirectError != ERROR_SUCCESS);
     }
     else
     {
@@ -6958,18 +6553,14 @@ HMODULE WINAPI HookStreamlineLoadLibraryExW(
         return nullptr;
     const std::wstring requested = fileName ? fileName : L"";
     const auto providerPlan = AmpereProviderLoadPlan(requested, file, flags);
-    const std::wstring redirect = providerPlan ? providerPlan.path
-        : SelectiveOtaDlssgWrapperRedirectPath(requested);
+    const std::wstring redirect = providerPlan ? providerPlan.path : std::wstring{};
     HMODULE module = redirect.empty() ? original(fileName, file, flags)
         : original(redirect.c_str(), file, flags);
     if (!redirect.empty())
     {
         VerifySelectedProviderLoad(providerPlan, requested, module);
-        const DWORD redirectError = module ? ERROR_SUCCESS : GetLastError();
         if (!module)
             module = original(fileName, file, flags);
-        if (!providerPlan) RecordSelectiveOtaDlssgWrapperResult(requested, redirect, module,
-            redirectError, redirectError != ERROR_SUCCESS);
     }
     InspectStreamlineLoadedModule(module);
     return module;
@@ -7069,12 +6660,10 @@ sl::Result HookSlInit(const sl::Preferences& preferences,
     auto* original = EntryOriginal(gOriginalSlInit, gSlInitEntryHandle);
     if (!original || original == &HookSlInit)
         return sl::Result::eErrorNotInitialized;
-#if defined(MFG_UNLOCK_SINGLE_MODULE_UI)
     // Recheck application factory imports at the existing early boundary.
     // The UI creates no graphics objects and modifies no native/Streamline tables.
     // The entry detour jumps here, so this is the game's slInit call site.
     single_overlay::BeforeStreamlineInit(_ReturnAddress());
-#endif
     const auto maskInitEntry = entry_detour::ReadSnapshot(gSlInitEntryHandle);
     {
         std::lock_guard lock(gOutputPullMaskInitMutex);
@@ -7109,7 +6698,6 @@ sl::Result HookSlInit(const sl::Preferences& preferences,
         interposer = GetModuleHandleW(L"sl.interposer.dll");
     const std::wstring interposerPath = interposer
         ? LoadedModulePath(interposer) : std::wstring{};
-#if defined(MFG_UNLOCK_SINGLE_MODULE_UI)
     // Publish the existing resolver gateway before slInit can cache Vulkan
     // entry points inside the interposer. The worker may not have seen it yet.
     if (interposer)
@@ -7122,7 +6710,6 @@ sl::Result HookSlInit(const sl::Preferences& preferences,
         // patches the DLSS-G wrapper before the plugins read their limits.
         TryInstallSlSetD3DDeviceEntryDetour(interposer);
     }
-#endif
     if (interposer
         && !gStreamlineLoaderDiscoveryInstalled.load(
             std::memory_order_acquire))
@@ -7152,10 +6739,8 @@ sl::Result HookSlInit(const sl::Preferences& preferences,
     gStreamlineHostVersionPrivate.store(
         hostVersion.privatePart, std::memory_order_relaxed);
     // Selectively redirecting only sl.dlss_g crossed Streamline ABI families
-    // and caused startup failures. Retire that route: official 6X titles opt
-    // into Streamline's coherent full-set OTA selection instead.
-    ConfigureSelectiveOtaDlssgWrapper(false,
-        providerPreflight, loaderDiscovery);
+    // and caused startup failures, so that route is retired: official 6X titles
+    // opt into Streamline's coherent full-set OTA selection instead.
     // slSetD3DDevice normally follows slInit. Trusted NVAPI inventory may
     // request the coherent downloaded plugin set before that boundary, but
     // does not select gpu_dispatch or relax its later adapter/LUID checks.
@@ -7276,7 +6861,6 @@ bool HostInterposer(HMODULE interposer, const std::wstring& path) noexcept
     return HostInterposer(interposer, path.c_str(), path.size());
 }
 
-#if defined(MFG_UNLOCK_SINGLE_MODULE_UI)
 // Manual-hooking hosts (Streamline eUseManualHooking, e.g. Wuthering Waves)
 // create native DXGI objects themselves, so no factory or swapchain creation
 // reaches the menu. Streamline returns its factory proxy here; the menu wraps
@@ -7390,17 +6974,6 @@ bool TryInstallSlSetD3DDeviceEntryDetour(HMODULE interposer)
     }
     return installed;
 }
-#else
-bool TryInstallSlUpgradeInterfaceEntryDetour(HMODULE, void*)
-{
-    return false;
-}
-
-bool TryInstallSlSetD3DDeviceEntryDetour(HMODULE)
-{
-    return false;
-}
-#endif
 
 bool TryInstallSlInitEntryDetour(HMODULE interposer, void* resolvedTarget)
 {
@@ -7456,10 +7029,8 @@ FARPROC WINAPI HookMainGetProcAddress(HMODULE module, LPCSTR functionName)
         && ngx_initialization::IsEntry(functionName))
         InspectLoadedModule(module, LoadedModulePath(module));
     if (resolved && gpu_dispatch::IsAda()) dlssg_preset::PrepareForExport(module, functionName);
-#if defined(MFG_UNLOCK_SINGLE_MODULE_UI)
     if (resolved) single_overlay::application_imports::ArmModule(module);
     resolved = single_overlay::ResolveProc(module, functionName, resolved);
-#endif
     if (!resolved || !functionName
         || reinterpret_cast<uintptr_t>(functionName) <= 0xFFFFu)
     {
@@ -7534,7 +7105,6 @@ FARPROC WINAPI HookMainGetProcAddress(HMODULE module, LPCSTR functionName)
                 LoadedModulePath(module).c_str());
         return reinterpret_cast<FARPROC>(&HookSlSetTagForFrame);
     }
-#if defined(MFG_UNLOCK_SINGLE_MODULE_UI)
     if (std::strcmp(functionName, "slUpgradeInterface") == 0)
     {
         if (TryInstallSlUpgradeInterfaceEntryDetour(module,
@@ -7548,7 +7118,6 @@ FARPROC WINAPI HookMainGetProcAddress(HMODULE module, LPCSTR functionName)
             std::memory_order_release);
         return reinterpret_cast<FARPROC>(&HookSlUpgradeInterface);
     }
-#endif
     if (std::strcmp(functionName, "slInit") != 0)
         return resolved;
 
@@ -7571,7 +7140,6 @@ bool InstallMainResolverDiscovery()
     bool installed = HookMainExecutableImport("KERNEL32.dll",
         "GetProcAddress", reinterpret_cast<void*>(&HookMainGetProcAddress),
         original);
-#if defined(MFG_UNLOCK_SINGLE_MODULE_UI)
     if (!installed)
     {
         // GTA Enhanced has four-byte-aligned x64 imports. Preserve the strict
@@ -7593,7 +7161,6 @@ bool InstallMainResolverDiscovery()
             return false;
         });
     }
-#endif
     if (original)
     {
         const auto candidate = reinterpret_cast<GetProcAddressFn>(original);
@@ -7648,14 +7215,12 @@ FARPROC WINAPI HookSlCommonGetProcAddress(
     FARPROC resolved = original(module, functionName);
     // RTX 30: the DLSS-G wrapper's flip-metering probe (no-op otherwise).
     resolved = AmpereWrapperNvapiView(module, functionName, resolved, _ReturnAddress());
-#if defined(MFG_UNLOCK_SINGLE_MODULE_UI)
     // Vulkan is often resolved inside Streamline rather than the executable.
     // Reuse its established resolver boundary without wrapping internal DXGI
     // factories or changing shared Streamline/native method implementations.
     if (functionName && reinterpret_cast<uintptr_t>(functionName) > 0xFFFFu
         && functionName[0] == 'v' && functionName[1] == 'k')
         resolved = single_overlay::ResolveProc(module, functionName, resolved);
-#endif
     if (resolved && reinterpret_cast<uintptr_t>(functionName) > 0xFFFFu
         && ngx_initialization::IsEntry(functionName))
         InspectLoadedModule(module, LoadedModulePath(module));
@@ -8344,290 +7909,6 @@ FileVersion ReadFileVersion(const std::wstring& path)
     return version;
 }
 
-bool ReadDiskWrapperProfile(const std::wstring& path,
-    uint32_t& compiledMaximum)
-{
-    compiledMaximum = 0;
-    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE)
-        return false;
-
-    LARGE_INTEGER size{};
-    const bool validSize = GetFileSizeEx(file, &size)
-        && size.QuadPart >= static_cast<LONGLONG>(sizeof(IMAGE_DOS_HEADER))
-        && size.QuadPart <= 32ll * 1024ll * 1024ll;
-    if (!validSize)
-    {
-        CloseHandle(file);
-        return false;
-    }
-
-    std::vector<uint8_t> bytes(static_cast<size_t>(size.QuadPart));
-    DWORD bytesRead = 0;
-    const BOOL read = ReadFile(file, bytes.data(),
-        static_cast<DWORD>(bytes.size()), &bytesRead, nullptr);
-    CloseHandle(file);
-    if (!read || bytesRead != bytes.size())
-        return false;
-
-    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(bytes.data());
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0
-        || static_cast<size_t>(dos->e_lfanew)
-            > bytes.size() - sizeof(IMAGE_NT_HEADERS64))
-    {
-        return false;
-    }
-    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(
-        bytes.data() + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE
-        || nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64
-        || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
-    {
-        return false;
-    }
-    const auto* sections = IMAGE_FIRST_SECTION(nt);
-    const size_t sectionTableOffset = reinterpret_cast<const uint8_t*>(sections)
-        - bytes.data();
-    const size_t sectionTableBytes = static_cast<size_t>(
-        nt->FileHeader.NumberOfSections) * sizeof(IMAGE_SECTION_HEADER);
-    if (sectionTableOffset > bytes.size()
-        || sectionTableBytes > bytes.size() - sectionTableOffset)
-    {
-        return false;
-    }
-
-    size_t matchCount = 0;
-    uint32_t matchedMaximum = 0;
-    for (unsigned index = 0; index < nt->FileHeader.NumberOfSections;
-         ++index)
-    {
-        const IMAGE_SECTION_HEADER& section = sections[index];
-        if ((section.Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0
-            || section.PointerToRawData >= bytes.size())
-        {
-            continue;
-        }
-        const size_t available = bytes.size() - section.PointerToRawData;
-        const size_t sectionSize = std::min<size_t>(
-            section.SizeOfRawData, available);
-        const uint8_t* begin = bytes.data() + section.PointerToRawData;
-        for (size_t offset = 0;
-             offset + universal_wrapper_profile::kPatternSize <= sectionSize;
-             ++offset)
-        {
-            if (!universal_wrapper_profile::Matches(
-                    begin + offset, sectionSize - offset))
-            {
-                continue;
-            }
-            uint32_t maximum = 0;
-            memcpy(&maximum,
-                begin + offset
-                    + universal_wrapper_profile::kMaximumOffset,
-                sizeof(maximum));
-            matchedMaximum = maximum;
-            ++matchCount;
-        }
-    }
-    if (matchCount != 1)
-        return false;
-    compiledMaximum = matchedMaximum;
-    return true;
-}
-
-bool FindSelectiveOtaDlssgWrapper(std::wstring& selectedPath,
-    FileVersion& selectedVersion,
-    SelectiveOtaDlssgWrapperFailure& failure)
-{
-    std::wstring programData(32768, L'\0');
-    const DWORD length = GetEnvironmentVariableW(
-        L"ProgramData", programData.data(),
-        static_cast<DWORD>(programData.size()));
-    if (length == 0 || length >= programData.size())
-    {
-        failure = SelectiveOtaDlssgWrapperFailure::eProgramDataUnavailable;
-        return false;
-    }
-    programData.resize(length);
-
-    const std::wstring versionsRoot = JoinPath(
-        programData,
-        L"NVIDIA\\NGX\\models\\sl_dlss_g_0\\versions");
-    WIN32_FIND_DATAW versionEntry{};
-    HANDLE versions = FindFirstFileW(
-        JoinPath(versionsRoot, L"*").c_str(), &versionEntry);
-    if (versions == INVALID_HANDLE_VALUE)
-    {
-        failure = SelectiveOtaDlssgWrapperFailure::eNoCompatibleCandidate;
-        return false;
-    }
-
-    bool found = false;
-    do
-    {
-        if ((versionEntry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0
-            || wcscmp(versionEntry.cFileName, L".") == 0
-            || wcscmp(versionEntry.cFileName, L"..") == 0)
-        {
-            continue;
-        }
-        const std::wstring filesRoot = JoinPath(JoinPath(
-            versionsRoot, versionEntry.cFileName), L"files");
-        WIN32_FIND_DATAW fileEntry{};
-        HANDLE files = FindFirstFileW(
-            JoinPath(filesRoot, L"*").c_str(), &fileEntry);
-        if (files == INVALID_HANDLE_VALUE)
-            continue;
-        do
-        {
-            if ((fileEntry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
-                continue;
-            const std::wstring path = JoinPath(filesRoot, fileEntry.cFileName);
-            const FileVersion version = ReadFileVersion(path);
-            uint32_t compiledMaximum = 0;
-            if (!ReadDiskWrapperProfile(path, compiledMaximum))
-                continue;
-            const selective_ota_wrapper_policy::Version policyVersion{
-                version.major, version.minor, version.build,
-                version.privatePart};
-            if (!selective_ota_wrapper_policy::IsCompatibleCandidate(
-                    policyVersion, compiledMaximum))
-            {
-                continue;
-            }
-            const selective_ota_wrapper_policy::Version currentVersion{
-                selectedVersion.major, selectedVersion.minor,
-                selectedVersion.build, selectedVersion.privatePart};
-            if (!found || selective_ota_wrapper_policy::IsNewer(
-                    policyVersion, currentVersion))
-            {
-                found = true;
-                selectedPath = path;
-                selectedVersion = version;
-            }
-        } while (FindNextFileW(files, &fileEntry));
-        FindClose(files);
-    } while (FindNextFileW(versions, &versionEntry));
-    FindClose(versions);
-
-    failure = found ? SelectiveOtaDlssgWrapperFailure::eNone
-        : SelectiveOtaDlssgWrapperFailure::eNoCompatibleCandidate;
-    return found;
-}
-
-void ConfigureSelectiveOtaDlssgWrapper(bool requested,
-    bool providerSupported, bool loaderDiscoveryReady)
-{
-    gSelectiveOtaDlssgWrapperRequested.store(
-        requested, std::memory_order_release);
-    gSelectiveOtaDlssgWrapperCandidateReady.store(
-        false, std::memory_order_release);
-    gSelectiveOtaDlssgWrapperVersionMajor.store(0,
-        std::memory_order_relaxed);
-    gSelectiveOtaDlssgWrapperVersionMinor.store(0,
-        std::memory_order_relaxed);
-    gSelectiveOtaDlssgWrapperVersionBuild.store(0,
-        std::memory_order_relaxed);
-    gSelectiveOtaDlssgWrapperVersionPrivate.store(0,
-        std::memory_order_relaxed);
-    {
-        std::lock_guard lock(gSelectiveOtaDlssgWrapperMutex);
-        gSelectiveOtaDlssgWrapperPath.clear();
-    }
-    if (!requested)
-    {
-        gSelectiveOtaDlssgWrapperFailure.store(
-            static_cast<uint32_t>(
-                SelectiveOtaDlssgWrapperFailure::eNone),
-            std::memory_order_release);
-        return;
-    }
-    if (!providerSupported)
-    {
-        gSelectiveOtaDlssgWrapperFailure.store(
-            static_cast<uint32_t>(SelectiveOtaDlssgWrapperFailure::
-                eProviderUnsupported), std::memory_order_release);
-        Log(L"Selective DLSS-G wrapper route suppressed: provider "
-            L"preflight failed");
-        return;
-    }
-    if (!loaderDiscoveryReady)
-    {
-        gSelectiveOtaDlssgWrapperFailure.store(
-            static_cast<uint32_t>(SelectiveOtaDlssgWrapperFailure::
-                eLoaderDiscoveryUnavailable), std::memory_order_release);
-        Log(L"Selective DLSS-G wrapper route suppressed: loader "
-            L"interception unavailable before slInit");
-        return;
-    }
-
-    std::wstring path;
-    FileVersion version{};
-    SelectiveOtaDlssgWrapperFailure failure =
-        SelectiveOtaDlssgWrapperFailure::eNoCompatibleCandidate;
-    if (!FindSelectiveOtaDlssgWrapper(path, version, failure))
-    {
-        gSelectiveOtaDlssgWrapperFailure.store(
-            static_cast<uint32_t>(failure), std::memory_order_release);
-        Log(L"Selective DLSS-G wrapper route unavailable: failure=%u",
-            static_cast<uint32_t>(failure));
-        return;
-    }
-
-    {
-        std::lock_guard lock(gSelectiveOtaDlssgWrapperMutex);
-        gSelectiveOtaDlssgWrapperPath = path;
-    }
-    gSelectiveOtaDlssgWrapperVersionMajor.store(
-        version.major, std::memory_order_relaxed);
-    gSelectiveOtaDlssgWrapperVersionMinor.store(
-        version.minor, std::memory_order_relaxed);
-    gSelectiveOtaDlssgWrapperVersionBuild.store(
-        version.build, std::memory_order_relaxed);
-    gSelectiveOtaDlssgWrapperVersionPrivate.store(
-        version.privatePart, std::memory_order_relaxed);
-    gSelectiveOtaDlssgWrapperFailure.store(
-        static_cast<uint32_t>(SelectiveOtaDlssgWrapperFailure::eNone),
-        std::memory_order_release);
-    gSelectiveOtaDlssgWrapperCandidateReady.store(
-        true, std::memory_order_release);
-    Log(L"Selective DLSS-G wrapper candidate ready: version=%u.%u.%u.%u "
-        L"compiledMaximum=5 path=%s", version.major, version.minor,
-        version.build, version.privatePart, path.c_str());
-}
-
-std::wstring SelectiveOtaDlssgWrapperRedirectPath(
-    const std::wstring& requestedPath)
-{
-    if (!gSelectiveOtaDlssgWrapperCandidateReady.load(
-            std::memory_order_acquire)
-        || !ModuleFileNameEquals(requestedPath, L"sl.dlss_g.dll"))
-    {
-        return {};
-    }
-
-    if (requestedPath.find_first_of(L"\\/") != std::wstring::npos)
-    {
-        std::wstring absolutePath(32768, L'\0');
-        const DWORD length = GetFullPathNameW(requestedPath.c_str(),
-            static_cast<DWORD>(absolutePath.size()),
-            absolutePath.data(), nullptr);
-        if (length == 0 || length >= absolutePath.size())
-            return {};
-        absolutePath.resize(length);
-        if (_wcsicmp(ParentPath(absolutePath).c_str(),
-                gExecutableDirectory.c_str()) != 0)
-        {
-            return {};
-        }
-    }
-
-    std::lock_guard lock(gSelectiveOtaDlssgWrapperMutex);
-    return gSelectiveOtaDlssgWrapperPath;
-}
-
 class ScopedModuleReference
 {
 public:
@@ -9072,9 +8353,7 @@ void InspectAlreadyLoadedModules()
         {
             HMODULE module = reinterpret_cast<HMODULE>(entry.modBaseAddr);
             loadedModules.push_back(module);
-#if defined(MFG_UNLOCK_SINGLE_MODULE_UI)
             single_overlay::application_imports::ArmModule(module);
-#endif
             InspectLoadedModule(module, entry.szExePath);
             entry.dwSize = sizeof(entry);
         } while (Module32NextW(snapshot, &entry));
@@ -9109,7 +8388,6 @@ using MfgLdrDllNotificationFunction = void (CALLBACK*)(
 using LdrRegisterDllNotificationFn = NTSTATUS (NTAPI*)(
     ULONG flags, MfgLdrDllNotificationFunction callback, void* context, void** cookie);
 
-#if defined(MFG_UNLOCK_SINGLE_MODULE_UI)
 // Reads a named, non-forwarded export from a mapped image's export table.
 void* MappedExportAddress(HMODULE module, const char* expected) noexcept
 {
@@ -9199,19 +8477,16 @@ bool UnicodeNameEquals(const UNICODE_STRING* name, const wchar_t* expected) noex
     return name && name->Buffer && name->Length == length * sizeof(wchar_t)
         && _wcsnicmp(name->Buffer, expected, length) == 0;
 }
-#endif
 
 void CALLBACK OnDllNotification(
     ULONG reason, const MfgLdrDllNotificationData* data, void*)
 {
     static constexpr ULONG kDllLoaded = 1;
     static constexpr ULONG kDllUnloaded = 2;
-#if defined(MFG_UNLOCK_SINGLE_MODULE_UI)
     if (data && reason == kDllLoaded && data->loaded.dllBase
         && UnicodeNameEquals(data->loaded.baseDllName, L"sl.interposer.dll"))
         InstallSlInitEntryAtLoad(static_cast<HMODULE>(data->loaded.dllBase),
             data->loaded.fullDllName);
-#endif
     // NGX validates a DLSS-G snippet against the GPU right after mapping it.
     // Declare RTX 30 support before LoadLibrary returns (no waits or logging).
     if (data && reason == kDllLoaded && data->loaded.dllBase && ampere_provider_arch::Armed())
@@ -9228,14 +8503,12 @@ void CALLBACK OnDllNotification(
         optiscaler_host::ObserveMappedModule(static_cast<HMODULE>(data->loaded.dllBase));
     if (data && (reason == kDllLoaded || reason == kDllUnloaded))
     {
-#if MFG_UNLOCK_OUTPUT_PULL_MASK_ONLY || MFG_UNLOCK_RUNTIME_GPU_SELECTION || MFG_UNLOCK_AMPERE_MFG
         const uintptr_t module = reinterpret_cast<uintptr_t>(
             reason == kDllLoaded ? data->loaded.dllBase : data->unloaded.dllBase);
         if (reason == kDllLoaded)
             gOutputPullMaskLoads.Loaded(module);
         else
             gOutputPullMaskLoads.Unloaded(module);
-#endif
         gModuleInventoryDirty.store(true, std::memory_order_release);
     }
 }
@@ -9273,9 +8546,7 @@ DWORD WINAPI PatchWorker(void* context)
         gLog = _wfsopen(logPath.c_str(), L"w, ccs=UTF-8", _SH_DENYWR);
     }
     gLogReady.store(gLog != nullptr, std::memory_order_release);
-#if defined(MFG_UNLOCK_SINGLE_MODULE_UI)
     single_module::DrainLog(&MidpointLog);
-#endif
     fault_capture::Initialize(&MidpointLog);
 
     const std::wstring mappingName = MfgUnlockObjectName(L"Status", pid);
@@ -9304,9 +8575,6 @@ DWORD WINAPI PatchWorker(void* context)
     // The first atomic publication replaces the previous launch's snapshot.
     // Never delete a file another live process may still own.
     temporal_interval_trace::Initialize(tempDirectory, executablePath.c_str());
-#if MFG_UNLOCK_OUTPUT_PULL_TELEMETRY
-    output_pull_telemetry::Initialize(tempDirectory, pid);
-#endif
     ControlConfig savedControl = ReadInitialControl();
     optiscaler_host::SetUiOptIn(savedControl.optiScalerUi == 1);
     bool uiDelegated = optiscaler_host::UiDelegated();
@@ -9323,13 +8591,12 @@ DWORD WINAPI PatchWorker(void* context)
     ReadLastWriteTime(gConfigPath, configWriteTime);
     Log(L"Initial control: mode=%s multiplier=%ux dynamicTarget=%u FPS "
         L"dynamicExperimental56=%d generatedOnlyDebug=%d "
-        L"intervalLogging=%d selectiveOtaDlssgWrapper=%d; config: %s",
+        L"intervalLogging=%d; config: %s",
         initialControl.followGame ? L"follow"
             : initialControl.dynamic ? L"dynamic" : L"fixed",
         initialControl.multiplier,
         initialControl.dynamicTargetFrameRate, initialControl.dynamicExperimental56,
         initialControl.generatedOnlyDebug, initialControl.intervalLogging,
-        initialControl.selectiveOtaDlssgWrapper,
         gConfigPath.c_str());
     if (initialControl.intervalLogging)
     {
@@ -9341,15 +8608,10 @@ DWORD WINAPI PatchWorker(void* context)
     LogAmpereArchitectureDetection(ampere_provider_arch::DetectAndArm());
     Log(L"Diagnostics reused per executable: log=%s status=%s processBirth=%llu executable=%s",
         logPath.c_str(),gStatusPath.c_str(),static_cast<unsigned long long>(diagnostic_paths::ProcessBirth()),executablePath.c_str());
-    hudless_probe::SetLogSink(&MidpointLog);
-    hudless_visualizer::SetUiTagger(&TagSynthesizedUi);
-#if defined(MFG_UNLOCK_SINGLE_MODULE_UI)
     Log(L"RTXMFG build=1.5.0-hotfix.1 source=v1.5-flipmeter-20261006 base=intel6.6+optiscaler.1+ring2.3+dltb.2+slhost.1+flipmeter.18+hairdiscovery.1.4.2+reflexfg.2+capture.2+optixell.1+optiout.1+optipace.1+model2x.1+mvfill.1+uioff.1+uistable.1+mfgport.1+hudmatch.1+optiport.1+optcapture.1+optiportdefault.1+xefgdiscovery.1+slrestart.1+nvapipin.1+modeltoggle.1+uirefresh.1+noport.1+optiredirect.1+reflexport.1+portback.1+optionly.1+delayload.1+rtx30.3+xellungated.1+specialk.1a+themidaimports.1+modelchoice.1+xefgmodel.1+splat.2+scenechange.1+xellinput.1+rtx30sl2732.1+mfgunlocker.1+presetc.3+rtx30presetc.1+rtx30stable.1+rtx30ota.1+releaseleak.1 outputPullMask=%d occupancyHint=%d "
-        L"uiInputs=framed-observations uiRecomposition=game-managed "
-        L"hudlessDetection=tile-probe",
+        L"uiInputs=framed-observations uiRecomposition=game-managed",
         MFG_UNLOCK_OUTPUT_PULL_MASK_ONLY,
         MFG_UNLOCK_OUTPUT_PULL_MASK_OCCUPANCY);
-#endif
 #if MFG_UNLOCK_OUTPUT_PULL_MASK_ONLY
     // Publication can precede worker/log startup. Preserve the one-time result
     // here as well as at Create so early failures remain locally diagnosable.
@@ -9457,10 +8719,7 @@ DWORD WINAPI PatchWorker(void* context)
     for (;;)
     {
         Sleep(100);
-#if defined(MFG_UNLOCK_SINGLE_MODULE_UI)
         single_module::DrainLog(&MidpointLog);
-#endif
-        hudless_probe::Poll();
         ++inventoryTicks;
         if (gModuleInventoryDirty.exchange(false, std::memory_order_acq_rel))
         {
@@ -9544,9 +8803,6 @@ DWORD WINAPI PatchWorker(void* context)
 
         UpdatePresentationPolicy(activeControl);
         temporal_interval_trace::Flush();
-#if MFG_UNLOCK_OUTPUT_PULL_TELEMETRY
-        output_pull_telemetry::Flush();
-#endif
 
         const bool ready = BridgeReady();
         const std::string route = PatchRouteName();
@@ -9625,12 +8881,8 @@ void frame_telemetry::SamplePresentCounter(
 
 extern "C" __declspec(dllexport) BOOL WINAPI MfgUnlockSampleFrameTelemetry()
 {
-#if defined(MFG_UNLOCK_SINGLE_MODULE_UI)
     // A Vulkan/application callback alone does not count generated presents.
     return SampleFrameTelemetry(0, 0, false, true);
-#else
-    return SampleFrameTelemetry(0, 0, true, false);
-#endif
 }
 
 extern "C" __declspec(dllexport) BOOL WINAPI MfgUnlockCoreLoaded()
@@ -9638,11 +8890,7 @@ extern "C" __declspec(dllexport) BOOL WINAPI MfgUnlockCoreLoaded()
     return TRUE;
 }
 
-#if defined(MFG_UNLOCK_SINGLE_MODULE_UI)
 extern "C" BOOL WINAPI MfgUnlockCoreEntry(HINSTANCE instance, DWORD reason, LPVOID)
-#else
-BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID)
-#endif
 {
     if (reason == DLL_PROCESS_ATTACH)
     {

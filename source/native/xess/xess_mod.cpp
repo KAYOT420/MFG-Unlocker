@@ -7,7 +7,6 @@
 #include "xess_policy.h"
 #include "adapter_support.h"
 #include "xess_runtime.h"
-#include "present_capture.h"
 #include "single_overlay.h"
 #include "single_module.h"
 #include "overlay_device_identity.h"
@@ -349,9 +348,8 @@ bool SameDevice(ID3D12Device* a, ID3D12Device* b)
 // (ModelPort 15 -> 16; XeFG remaps its 2x model to it for more than one generated frame), with the
 // plain pacing owner. XeFG's 2x model (dev.42-45, kept by the fg_keep_2x_model site) rendered the
 // six-times outputs at t ~0.25/0.33/0.5/0.65/0.75 instead of 1/6..5/6 (dev.45 capture): smeared outer
-// outputs. RTXMFG_XESS_MODEL=2x, or xefg_model=2x in RTXMFG-capture.enable, selects the 2x model;
-// otherwise OptiScaler.ini [XeFG] XeFGModel (xefgmodel.1; earlier RtxmfgModel), then the control
-// file's xessModel. Read once, at the first tracked creation.
+// outputs. OptiScaler.ini [XeFG] XeFGModel (xefgmodel.1; earlier RtxmfgModel) selects it, then the
+// control file's xessModel. Read once, at the first tracked creation.
 std::atomic<uint32_t> gConfiguredModel{0};
 std::atomic<uint32_t> gHostModel{0};
 
@@ -366,27 +364,11 @@ struct ModelChoice
     std::string setting, ini, key;
 };
 
-ModelChoice ResolveModelChoice(const char* environment, const char* markerKey) noexcept
+ModelChoice ResolveModelChoice() noexcept
 {
     ModelChoice choice;
     try
     {
-        char value[8]{};
-        const DWORD length = GetEnvironmentVariableA(environment, value, DWORD(sizeof(value)));
-        if (length && length < sizeof(value))
-        {
-            choice.source = "environment";
-            choice.setting.assign(value, length);
-            choice.port = _stricmp(choice.setting.c_str(), "2x") != 0;
-            return choice;
-        }
-        if (auto option = xess_capture::StartupOption(markerKey); !option.empty())
-        {
-            choice.source = "capture_marker";
-            choice.setting = option;
-            choice.port = _stricmp(option.c_str(), "2x") != 0;
-            return choice;
-        }
         std::wstring setting, ini, key;
         uint32_t host = optiscaler_host::ReadXefgModel(setting, ini, key);
         choice.setting = utf8(setting);
@@ -414,7 +396,7 @@ std::string ModelChoiceFields(const ModelChoice& choice)
 
 const ModelChoice& TrackedModelChoice() noexcept
 {
-    static const ModelChoice choice = ResolveModelChoice("RTXMFG_XESS_MODEL", "xefg_model");
+    static const ModelChoice choice = ResolveModelChoice();
     return choice;
 }
 
@@ -426,14 +408,12 @@ bool PortedModelRequested() noexcept
 // OptiScaler's own XeFG (host contexts) on our port of Intel's MFG model instead of XeFG's 2x model.
 // dev.48 added it as a test option; beta.1 makes it the default: the dev.49 Witcher capture through
 // OptiScaler showed interpolated 6x outputs (no copies) at ~0.71-0.76 of a real frame's sharpness, and
-// the 2x model renders the outer outputs at the wrong timesteps (dev.45). RTXMFG_XESS_OPTISCALER_MODEL=2x,
-// or optiscaler_model=2x in RTXMFG-capture.enable beside this module, selects XeFG's 2x model (dev.41);
-// beta.5: otherwise OptiScaler.ini [XeFG] XeFGModel (xefgmodel.1; earlier RtxmfgModel), read when the
-// model is chosen (modelchoice.1), then the control file's xessModel. Decided once, at OptiScaler's
-// first XeFG creation.
+// the 2x model renders the outer outputs at the wrong timesteps (dev.45). beta.5: OptiScaler.ini [XeFG]
+// XeFGModel (xefgmodel.1; earlier RtxmfgModel), read when the model is chosen (modelchoice.1), then the
+// control file's xessModel. Decided once, at OptiScaler's first XeFG creation.
 const ModelChoice& HostModelChoice() noexcept
 {
-    static const ModelChoice choice = ResolveModelChoice("RTXMFG_XESS_OPTISCALER_MODEL", "optiscaler_model");
+    static const ModelChoice choice = ResolveModelChoice();
     return choice;
 }
 
@@ -471,22 +451,6 @@ std::string AcquireUnlock(State& state, HMODULE fg, HMODULE ll, bool keep2xModel
 std::string UnlockXellField(HMODULE ll)
 {
     return ",\"xell_layout\":\""+std::string(xess_layout::Get(ll, false).family)+"\"";
-}
-
-std::string_view EnvironmentValue(const char* name, char (&value)[16]) noexcept
-{
-    const DWORD length = GetEnvironmentVariableA(name, value, DWORD(sizeof(value)));
-    return length && length < sizeof(value) ? std::string_view(value, length) : std::string_view{};
-}
-
-// RTXMFG_XESS_FRAME_TIME_UNITS=ms|s forces the frameRenderTime units (read once).
-frame_time_profile::Units ForcedFrameTimeUnits() noexcept
-{
-    static const auto forced = [] {
-        char value[16]{};
-        return frame_time_profile::ForcedUnits(EnvironmentValue("RTXMFG_XESS_FRAME_TIME_UNITS", value));
-    }();
-    return forced;
 }
 
 // Every 120 game frames: the frame time the game hands XeSS-FG (milliseconds,
@@ -772,7 +736,6 @@ void InitializeOutsideLoaderLock() noexcept
             WriteLog("asi_start", "\"route\":\"universal_sdk\",\"asi_sha256\":\""+sha256(ModulePath(Self()))+"\"");
             Publish(state);
         }
-        xess_capture::Start(); // dev.37 diagnostic; nothing unless opted in
     }
     catch (...) {}
 }
@@ -840,9 +803,7 @@ void SubmitMotionFill(State& state, FgContext& context) noexcept
         uint32_t frame{};
         xefg_swapchain_d3d12_resource_data_t tag{};
         const char* reason{};
-        const bool submitted = context.motionFill->Submit(frame, tag,
-            [](ID3D12GraphicsCommandList* list, uint32_t id, const xefg_swapchain_d3d12_resource_data_t& data) {
-                xess_capture::OnTagResource(list, id, data); }, reason);
+        const bool submitted = context.motionFill->Submit(frame, tag, reason);
         if (!submitted) { LogMotionFill(context, reason); return; }
         const auto result = state.api.xefgSwapChainD3D12TagFrameResource(context.handle, nullptr, frame, &tag);
         if (result != XEFG_SWAPCHAIN_RESULT_SUCCESS) LogMotionFill(context, "tag_rejected");
@@ -887,9 +848,7 @@ void SubmitHudless(State& state, FgContext& context) noexcept
         uint32_t frame{};
         xefg_swapchain_d3d12_resource_data_t tag{};
         const char* reason{};
-        const bool submitted = context.hudlessMatch->Submit(backBuffer.Get(), frame, tag,
-            [](ID3D12GraphicsCommandList* list, uint32_t id, const xefg_swapchain_d3d12_resource_data_t& data) {
-                xess_capture::OnTagResource(list, id, data); }, reason);
+        const bool submitted = context.hudlessMatch->Submit(backBuffer.Get(), frame, tag, reason);
         if (!submitted) { LogHudlessMatch(context, reason); return; }
         const auto result = state.api.xefgSwapChainD3D12TagFrameResource(context.handle, nullptr, frame, &tag);
         if (result == XEFG_SWAPCHAIN_RESULT_SUCCESS) { context.hudlessMatchedKnown = true; context.hudlessMatchedFrame = frame; }
@@ -1022,18 +981,6 @@ xefg_swapchain_result_t HostCreateFg(State& state, ID3D12Device* device, xefg_sw
 // the others went out back to back (PresentMon, 10 Oct). After its initialization succeeds,
 // a host context gets the plain sdk_pacing owner: extra outputs go through XeFG's own pacing
 // wait and each deadline follows the batch interval (NativeDeadline).
-// RTXMFG_XESS_OPTISCALER_PACING=0 opts out.
-// dev.48: with the capture enabled the owner is also observed, so the final-present capture sees
-// OptiScaler's outputs (its input tags go straight to the provider and are not recorded).
-bool HostPacingEnabled() noexcept
-{
-    static const bool enabled = [] {
-        char value[8]{};
-        const DWORD length = GetEnvironmentVariableA("RTXMFG_XESS_OPTISCALER_PACING", value, DWORD(sizeof(value)));
-        return !(length == 1 && value[0] == '0');
-    }();
-    return enabled;
-}
 
 // scenechange.1: OptiScaler.ini [XeFG] XeFGSceneChangeThreshold = 0..1 sets XeFG's scene-change sensitivity on
 // OptiScaler's XeFG (xefgSwapChainSetSceneChangeThreshold; XeFG's default is 0.7, lower = fewer interpolations
@@ -1076,14 +1023,12 @@ xefg_swapchain_result_t HostInitFg(State& state, xefg_swapchain_handle_t handle,
     std::string failure;
     const bool intel = adapter_support::VendorOf(host.device.Get()) == adapter_support::kIntelVendor;
     const HMODULE fg = NativeFgModule();
-    if (!HostPacingEnabled()) failure = "disabled";
-    else if (intel) failure = "intel_adapter";
+    if (intel) failure = "intel_adapter";
     else if (!fg) failure = "no_provider_module";
     else if (sdk_pacing::Install(fg, failure))
-        host.paced = sdk_pacing::Register(handle, host.generation, host.device.Get(), failure, xess_capture::Enabled());
+        host.paced = sdk_pacing::Register(handle, host.generation, host.device.Get(), failure);
     WriteLog("host_pacing_owner", "\"generation\":"+std::to_string(host.generation)+",\"handle\":"+
         std::to_string(uintptr_t(handle))+",\"registered\":"+(host.paced ? "true" : "false")+
-        ",\"observed\":"+(host.paced && xess_capture::Enabled() ? "true" : "false")+
         (failure.empty() ? "" : ",\"reason\":\""+escape(failure)+"\""));
     return result;
 }
@@ -1308,9 +1253,8 @@ static xefg_swapchain_result_t InitializeFg(xefg_swapchain_handle_t handle,
         std::string pacingFailure;
         // dev.42: the plain owner dev.41 gave OptiScaler's own XeFG: each extra output goes through
         // XeFG's own pacing wait and each deadline follows the batch interval (DLSS-G's CPU pacer
-        // rules, NativeDeadline). With the capture enabled it is also observed (sdk_pacing::Register).
-        if (!sdk_pacing::Register(handle, context->generation, context->device.Get(), pacingFailure,
-            xess_capture::Enabled()))
+        // rules, NativeDeadline).
+        if (!sdk_pacing::Register(handle, context->generation, context->device.Get(), pacingFailure))
         {
             context->poisoned = true;
             context->initializationFailure = XEFG_SWAPCHAIN_RESULT_ERROR_UNSUPPORTED;
@@ -1424,18 +1368,6 @@ xefg_swapchain_result_t Hook_xefgSwapChainSetPresentId(xefg_swapchain_handle_t h
     return result;
 }
 
-// dev.42: the matrix slot fix is on unless RTXMFG_XESS_MATRIX_FIX=0 (read once). It only acts
-// when the slots classify as swapped (projection in the view slot, view in the projection slot).
-bool MatrixFixDefault() noexcept
-{
-    static const bool enabled = [] {
-        char value[8]{};
-        const DWORD length = GetEnvironmentVariableA("RTXMFG_XESS_MATRIX_FIX", value, DWORD(sizeof(value)));
-        return !(length == 1 && value[0] == '0');
-    }();
-    return enabled;
-}
-
 // dev.43: motion vectors for the game's own XeFG (xess_mod.h InputDiagnostics::motionVectors).
 // RTXMFG_XESS_MV_FILL: 0 = the game's own, 2 = all zero (diagnostic), otherwise the filled marker.
 uint32_t MotionFillDefault() noexcept
@@ -1479,8 +1411,8 @@ uint32_t HudlessMatchDefault() noexcept
     return mode;
 }
 
-// The matrix slot fix (dev.42) and the motion-vector source (dev.43), read once.
-static const bool matrixFixEnabled = MatrixFixDefault();
+// The motion-vector source (dev.43), read once. The matrix slot fix (dev.42) is always on; it only acts
+// when the slots classify as swapped (projection in the view slot, view in the projection slot).
 static const uint32_t motionMode = MotionFillDefault();
 static std::atomic<uint64_t> matrixSwaps{};
 
@@ -1533,8 +1465,7 @@ xefg_swapchain_result_t Hook_xefgSwapChainTagFrameConstants(xefg_swapchain_handl
     if (!context->initialized || context->poisoned) return XEFG_SWAPCHAIN_RESULT_ERROR_WRONG_CALL_ORDER;
     // Both SDK headers require milliseconds. The verified Cyberpunk and Witcher
     // builds supply seconds; since dev.33 every other game's units are detected per
-    // context (frame_time_profile::UnitDetector; RTXMFG_XESS_FRAME_TIME_UNITS forces
-    // them). Only our tracked context receives a copy; caller memory stays untouched.
+    // context (frame_time_profile::UnitDetector). Only our tracked context receives a copy; caller memory stays untouched.
     LARGE_INTEGER tagQpc{}, tagFrequency{};
     QueryPerformanceCounter(&tagQpc); QueryPerformanceFrequency(&tagFrequency);
     const double tagGapMs = context->lastConstantsQpc && tagQpc.QuadPart > context->lastConstantsQpc && tagFrequency.QuadPart > 0
@@ -1542,10 +1473,8 @@ xefg_swapchain_result_t Hook_xefgSwapChainTagFrameConstants(xefg_swapchain_handl
     const auto profile = WitcherProfile() ? frame_time_profile::Profile::eWitcher3Seconds
         : (CyberpunkProfile() ? frame_time_profile::Profile::eCyberpunkSeconds
             : frame_time_profile::Profile::eUnknown);
-    const auto forced = ForcedFrameTimeUnits();
     frame_time_profile::Units units{};
-    if (forced != frame_time_profile::Units::eUndecided) units = forced;
-    else if (frame_time_profile::IsSecondsProfile(profile)) units = frame_time_profile::Units::eSeconds;
+    if (frame_time_profile::IsSecondsProfile(profile)) units = frame_time_profile::Units::eSeconds;
     else
     {
         units = context->units.Observe(constants->frameRenderTime, tagGapMs);
@@ -1565,7 +1494,7 @@ xefg_swapchain_result_t Hook_xefgSwapChainTagFrameConstants(xefg_swapchain_handl
     // dev.38: put the view and projection back in their slots when the game passes them
     // swapped (Witcher, dev.37 frame_constants: view slot = reversed-Z projection, projection
     // slot = row-major view). Only XeFG's copy changes.
-    if (matrixFixEnabled && !strcmp(MatrixKind(adjusted.viewMatrix), "projection")
+    if (!strcmp(MatrixKind(adjusted.viewMatrix), "projection")
         && !strcmp(MatrixKind(adjusted.projectionMatrix), "view"))
     {
         float swap[16];
@@ -1580,13 +1509,12 @@ xefg_swapchain_result_t Hook_xefgSwapChainTagFrameConstants(xefg_swapchain_handl
     LogFrameConstants(*context, id, adjusted);
     if (result == XEFG_SWAPCHAIN_RESULT_SUCCESS)
     {
-        xess_capture::OnFrameConstants(id, adjusted);
         if (context->motionFill) context->motionFill->OnConstants(id, adjusted.viewMatrix, adjusted.projectionMatrix);
     }
     if (++context->constantsAttempts <= 3 && correction.converted)
         WriteLog("frame_time_units", "\"generation\":"+std::to_string(context->generation)+
             ",\"profile\":\""+(frame_time_profile::IsSecondsProfile(profile) ? frame_time_profile::Name(profile)
-                : forced != frame_time_profile::Units::eUndecided ? "forced" : "detected")+
+                : "detected")+
             "\",\"frame\":"+std::to_string(id)+",\"source_seconds\":"+
             (correction.validInput ? std::to_string(seconds) : "null")+",\"provider_milliseconds\":"+
             std::to_string(adjusted.frameRenderTime)+",\"result\":"+std::to_string(result));
@@ -1664,9 +1592,6 @@ xefg_swapchain_result_t Hook_xefgSwapChainD3D12TagFrameResource(xefg_swapchain_h
             ",\"consumed\":"+(consumed ? "true" : "false"));
     if (result == XEFG_SWAPCHAIN_RESULT_SUCCESS)
     {
-        // dev.37 diagnostic, opt-in; a consumed motion tag is recorded from our filled texture instead
-        // (dev.47: a consumed HUD-less tag from our converted texture).
-        if (!consumed) xess_capture::OnTagResource(commandList, id, *resource);
         if (type == XEFG_SWAPCHAIN_RES_DEPTH && context->motionFill)
             context->motionFill->OnDepth(graphics.Get(), id, *resource, fillMode);
         ++context->resourceAccepted[type];

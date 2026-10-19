@@ -13,7 +13,7 @@ cmake -S tests/release_regression -B build/release-tests `
     '-DVULKAN_LIBRARY=C:/VulkanSDK/1.2.176.1/Lib/vulkan-1.lib'
 cmake --build build/release-tests --config Release --parallel 6
 python tests/release_regression/run.py `
-    --dll build/v1.3.3-hotfix.2/Release/RTXMFG.dll `
+    --dll build/v1.5.1/Release/MFGUnlocker.dll `
     --harness-dir build/release-tests/Release `
     --output build/release-test-results `
     --provider C:/Fixtures/nvngx_dlssg.dll
@@ -32,10 +32,12 @@ window; Vulkan cases require a compatible NVIDIA Vulkan device. Missing debug
 or validation layers are reported in the individual logs.
 
 Coverage includes Dynamic availability for legacy runtimes and range limits,
-clean/default and saved controls, renamed loader forwarding
-and duplicate ownership, observed wrapper controls, NVIDIA policy limits,
-first-launch menu pixels and persistence across relaunch, WARP presentation and
-layered swapchains, and Vulkan direct/dynamic/internal-Streamline/mixed routes.
+clean/default and saved controls, loader forwarding under every documented
+proxy filename except the Bink names, duplicate ownership, observed wrapper
+controls, NVIDIA policy limits,
+first-launch menu pixels and persistence across relaunch, WARP presentation,
+layered and ReShade-wrapped swapchains, and Vulkan
+direct/dynamic/internal-Streamline/mixed routes.
 Hotfix coverage also includes unaligned DXGI factory imports, native adapter
 parent-factory returns, coexistence with existing hooks, writable/executable import tables,
 HDR interface forwarding, locked status files and process identity, renderer DLL
@@ -63,10 +65,12 @@ native. The swapchain must then present, open and close the menu.
 eight-byte-aligned `USER32` import slots sit in a data page that becomes
 executable after startup. The menu must open with game-only input suppression
 through public-entry detours, leaving the slot bytes and page protection as found.
-Run `FactoryRevisionTests.exe` directly from the Release harness directory for
-the source-level supported/unsupported revision, lazy-query and concurrent
-cache-lifetime cases. This target compiles the production proxy with isolated
-renderer/coordinator stubs; it does not exercise the release DLL's backend.
+`factory-revision-unit` runs `FactoryRevisionTests.exe` (built from `IMGUI_ROOT`,
+which is required) for the source-level supported/unsupported revision,
+lazy-query and concurrent cache-lifetime cases. This target compiles the
+production proxy with isolated renderer/coordinator stubs; it does not
+exercise the release DLL's backend. The `xinput1_1` to `xinput1_3` loader
+cases need those DLLs in System32 (DirectX End-User Runtime).
 
 These tests establish synthetic rendering, forwarding and CPU gate behavior.
 They do not establish live DLSS-G provider Evaluate output or ordered, distinct

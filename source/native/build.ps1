@@ -143,7 +143,6 @@ $arguments = @(
     "-DXESS_PROGRAMS_ROOT=$XessProgramsRoot",
     "-DVULKAN_INCLUDE_DIR=$VulkanIncludeDirectory",
     "-DGLSLANG_VALIDATOR=$(Join-Path $VulkanIncludeDirectory ../Bin/glslangValidator.exe)",
-    '-DMFG_UNLOCK_RUNTIME_GPU_SELECTION=ON',
     '-DMFG_UNLOCK_BUILD_SINGLE_MODULE=ON',
     "-DMFG_UNLOCK_OVERLAY_SKIP_GPU_WORK=$($SkipOverlayGpuWork.IsPresent.ToString().ToUpperInvariant())",
     "-DMFG_UNLOCK_NGX_CREATE_RESULT_DIAGNOSTICS=$($EnableNgxCreateResultDiagnostics.IsPresent.ToString().ToUpperInvariant())",
@@ -154,10 +153,6 @@ $arguments = @(
     "-DMFG_UNLOCK_OVERLAY_TEST_FAULTS=$($EnableOverlayTestFaults.IsPresent.ToString().ToUpperInvariant())",
     '-DMFG_UNLOCK_OUTPUT_PULL_MASK_ONLY=ON',
     '-DMFG_UNLOCK_OUTPUT_PULL_MASK_OCCUPANCY=OFF',
-    '-DMFG_UNLOCK_OUTPUT_PULL_EXPERIMENT=OFF',
-    '-DMFG_UNLOCK_OUTPUT_PULL_TELEMETRY=OFF',
-    '-DMFG_UNLOCK_PREV2CURR_EXPERIMENT=OFF',
-    '-DMFG_UNLOCK_INTERM_SCATTER_EXPERIMENT=OFF',
     '-DMFG_AMPERE_EMBEDDED_KERNELS=ON',
     '-DMFG_AMPERE_KERNEL_IMAGE=AUTO',
     "-DMFG_AMPERE_NATIVE_MANIFEST=$(Join-Path $nativeCache 'ampere_native_manifest.inc')",
@@ -221,10 +216,6 @@ if ($EnableOverlayTestFaults.IsPresent -and -not ($EnableBoundedOverlayRedesign.
 }
 if ($EnableBoundedOverlayRedesign.IsPresent -and $DisableSingleOverlay.IsPresent) {
     throw 'The bounded redesign and the no-overlay diagnostic are exclusive'
-}
-foreach ($legacyExperiment in @('MFG_UNLOCK_OUTPUT_PULL_EXPERIMENT', 'MFG_UNLOCK_OUTPUT_PULL_TELEMETRY',
-    'MFG_UNLOCK_PREV2CURR_EXPERIMENT', 'MFG_UNLOCK_INTERM_SCATTER_EXPERIMENT')) {
-    Assert-CacheValue $legacyExperiment 'OFF'
 }
 
 $compilerMetadata = Get-ChildItem -LiteralPath (Join-Path $BuildDirectory 'CMakeFiles') `

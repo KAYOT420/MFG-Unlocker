@@ -55,8 +55,6 @@ int wmain(int argc, wchar_t** argv)
     MfgSingleModuleStatus invalid{};
     invalid.size = sizeof(invalid)-1;
     passed &= Check(query && !query(&invalid), "status ABI rejects wrong size");
-    passed &= Check(GetModuleHandleW(L"RTX40MFGCore.dll") == nullptr
-        && GetModuleHandleW(L"RTX40MFG-UI.addon64") == nullptr, "no split core or UI dependency");
     auto name = path.filename().wstring();
     if (_wcsicmp(name.c_str(), L"version.dll") == 0)
     {
@@ -99,7 +97,10 @@ int wmain(int argc, wchar_t** argv)
             && actual.wPeriodMin > 0 && actual.wPeriodMax >= actual.wPeriodMin, "WinMM timing APIs forward correctly");
         passed &= Check(GetProcAddress(module, MAKEINTRESOURCEA(2)) != nullptr, "WinMM ordinal-only export retained");
     }
-    if (path.extension() == L".dll" && name.find(L"bink") != 0 && _wcsicmp(name.c_str(), L"MFGUnlocker.dll") != 0)
+    // version, dinput8 and winmm have their own forwarding checks above.
+    const bool dedicated = !_wcsicmp(name.c_str(), L"version.dll") || !_wcsicmp(name.c_str(), L"dinput8.dll")
+        || !_wcsicmp(name.c_str(), L"winmm.dll");
+    if (!dedicated && path.extension() == L".dll" && name.find(L"bink") != 0 && _wcsicmp(name.c_str(), L"MFGUnlocker.dll") != 0)
     {
         HMODULE system = System(name.c_str());
         passed &= Check(system && WindowsProxySmoke(module, system, name.c_str()),

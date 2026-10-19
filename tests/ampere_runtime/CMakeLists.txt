@@ -39,3 +39,9 @@ target_compile_definitions(SelectionOld PRIVATE FIXTURE_MINOR=1 FIXTURE_BUILD=0)
 target_compile_definitions(SelectionNew PRIVATE FIXTURE_MINOR=9 FIXTURE_BUILD=1)
 target_compile_definitions(SelectionUnsupported PRIVATE FIXTURE_MINOR=10 FIXTURE_BUILD=0)
 target_compile_definitions(SelectionSibling PRIVATE FIXTURE_MINOR=9 FIXTURE_BUILD=1 FIXTURE_SIBLING=1)
+# No inputs: run with every build. The flip-metering, wrapper, selection and architecture tests take real
+# Streamline wrappers and DLSS-G providers as arguments (see BUILD.md).
+enable_testing()
+foreach(target AmpereBatchTests AmpereOptionsTests AmpereStatusFieldsTests StreamlineOtaTests)
+    add_test(NAME ${target} COMMAND ${target})
+endforeach()

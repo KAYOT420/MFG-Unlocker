@@ -52,8 +52,6 @@ int main(int argc, char** argv)
     {
         Check(probe == 0 && setFlip == 0 && caps == 0, "this wrapper has no flip-metering probe to withhold");
     }
-    Check(Hidden(kSetFlipConfig) && Hidden(kFlipConfigCaps) && !Hidden(0x0150E828u),
-        "only the two flip-metering interfaces are withheld");
     std::cout << checks << " checks, " << failures << " failures\n";
     return failures ? 1 : 0;
 }

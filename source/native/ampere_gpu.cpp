@@ -1,4 +1,6 @@
 #include "ampere_gpu.h"
+#include "provider_image.h"
+#include "sha256_util.h"
 #include "dlssg_provider_policy.h"
 #include "protected_pointer.h"
 #include "ampere_native_cache.h"
@@ -32,6 +34,15 @@ namespace ampere_gpu
 {
 namespace
 {
+using provider_image::SameName;
+using provider_image::SafeCopy;
+using provider_image::SafeRead;
+using provider_image::ReadU16;
+using provider_image::ReadU32;
+using provider_image::ReadU64;
+using provider_image::ImageSize;
+using provider_image::FindUniqueBytes;
+using provider_image::PackLuid;
 constexpr size_t kKernelCount = 25;
 constexpr size_t kMaximumKernelCount = ampere_native_cache::kMaximumSlots;
 constexpr size_t kDescriptorBytes = 48;
@@ -165,13 +176,6 @@ constexpr bool OutputPullMaskSlot(const TemporalProviderProfile& profile, size_t
     return profile.outputPullSlot ? slot == profile.outputPullSlot : slot == 14 && profile.temporalSlot == 9;
 }
 
-constexpr bool SameName(const char* a, const char* b) noexcept
-{
-    if (!a || !b) return false;
-    for (; *a || *b; ++a, ++b)
-        if (*a != *b) return false;
-    return true;
-}
 static_assert([] {
     if (!SameName(k310916KernelNames[0], k3109KernelNames[0])
         || !SameName(k310916KernelNames[1], "BlendCandidatesFGLite")) return false;
@@ -310,99 +314,17 @@ void Log(const wchar_t* format, ...) noexcept
     callback(message);
 }
 
-bool SafeCopy(void* destination, const void* source, size_t bytes) noexcept
-{
-    if (!destination || !source || bytes == 0)
-        return false;
-    __try
-    {
-        std::memcpy(destination, source, bytes);
-        return true;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        return false;
-    }
-}
 
-template <typename T>
-bool SafeRead(uintptr_t address, T& value) noexcept
-{
-    return SafeCopy(&value, reinterpret_cast<const void*>(address),
-        sizeof(value));
-}
 
-uint16_t ReadU16(const uint8_t* bytes) noexcept
-{
-    uint16_t value = 0;
-    std::memcpy(&value, bytes, sizeof(value));
-    return value;
-}
 
-uint32_t ReadU32(const uint8_t* bytes) noexcept
-{
-    uint32_t value = 0;
-    std::memcpy(&value, bytes, sizeof(value));
-    return value;
-}
 
-uint64_t ReadU64(const uint8_t* bytes) noexcept
-{
-    uint64_t value = 0;
-    std::memcpy(&value, bytes, sizeof(value));
-    return value;
-}
 
 bool Sha256Equals(const uint8_t* bytes, size_t count,
     const char* expected) noexcept
 {
-    if (!bytes || count == 0 || count > ULONG_MAX || !expected
-        || std::strlen(expected) != 64)
-        return false;
-
-    BCRYPT_ALG_HANDLE algorithm = nullptr;
-    std::array<uint8_t, 32> digest{};
-    NTSTATUS status = BCryptOpenAlgorithmProvider(&algorithm,
-        BCRYPT_SHA256_ALGORITHM, nullptr, 0);
-    if (status >= 0)
-    {
-        status = BCryptHash(algorithm, nullptr, 0,
-            const_cast<PUCHAR>(bytes), static_cast<ULONG>(count),
-            digest.data(), static_cast<ULONG>(digest.size()));
-    }
-    if (algorithm)
-        BCryptCloseAlgorithmProvider(algorithm, 0);
-    if (status < 0)
-        return false;
-
-    static constexpr char kDigits[] = "0123456789ABCDEF";
-    for (size_t index = 0; index < digest.size(); ++index)
-    {
-        if (expected[index * 2] != kDigits[digest[index] >> 4]
-            || expected[index * 2 + 1] != kDigits[digest[index] & 0x0F])
-            return false;
-    }
-    return true;
+    return sha256_util::EqualsUpperHex(bytes, count, expected, ULONG_MAX);
 }
 
-bool ImageSize(HMODULE module, uint32_t& imageSize) noexcept
-{
-    imageSize = 0;
-    const uintptr_t base = reinterpret_cast<uintptr_t>(module);
-    IMAGE_DOS_HEADER dos{};
-    if (!base || !SafeRead(base, dos) || dos.e_magic != IMAGE_DOS_SIGNATURE
-        || dos.e_lfanew <= 0
-        || static_cast<uintptr_t>(dos.e_lfanew) > UINTPTR_MAX - base)
-        return false;
-    IMAGE_NT_HEADERS64 nt{};
-    if (!SafeRead(base + static_cast<uintptr_t>(dos.e_lfanew), nt)
-        || nt.Signature != IMAGE_NT_SIGNATURE
-        || nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC
-        || nt.OptionalHeader.SizeOfImage < sizeof(nt))
-        return false;
-    imageSize = nt.OptionalHeader.SizeOfImage;
-    return true;
-}
 
 bool IsReadOnlyImageAddress(HMODULE module, uintptr_t address) noexcept
 {
@@ -913,22 +835,6 @@ bool DecompressNvidiaLz(const uint8_t* input, size_t inputSize,
     return inputOffset == inputSize && outputOffset == outputSize;
 }
 
-size_t FindUniqueBytes(const uint8_t* bytes, size_t count,
-    const char* marker, size_t markerBytes) noexcept
-{
-    if (!bytes || !marker || markerBytes == 0 || markerBytes > count)
-        return SIZE_MAX;
-    size_t match = SIZE_MAX;
-    for (size_t offset = 0; offset + markerBytes <= count; ++offset)
-    {
-        if (std::memcmp(bytes + offset, marker, markerBytes) != 0)
-            continue;
-        if (match != SIZE_MAX)
-            return SIZE_MAX;
-        match = offset;
-    }
-    return match;
-}
 
 struct Sm89PtxMetadata
 {
@@ -1330,11 +1236,6 @@ ProgramPublicationResult PublishProgram(PublishedProgram& program,
     return result;
 }
 
-uint64_t PackLuid(const LUID& luid) noexcept
-{
-    return static_cast<uint64_t>(luid.LowPart)
-        | (static_cast<uint64_t>(static_cast<uint32_t>(luid.HighPart)) << 32);
-}
 
 void SetFailure(Failure failure) noexcept;
 bool VerifyAmpereAdapter(const LUID&, int&, int&) noexcept;

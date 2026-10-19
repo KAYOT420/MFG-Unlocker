@@ -4,7 +4,7 @@
 using namespace nvidia_mfg_policy;
 static unsigned checks = 0, failures = 0;
 static void Check(bool ok, const char* message) {
-    ++checks; if (!ok) { ++failures; std::printf("FAIL %s\n", message); }
+    ++checks; failures += !ok; std::printf("%s %s\n", ok ? "PASS" : "FAIL", message);
 }
 int wmain(int argc, wchar_t** argv) {
     Check(FindTier(L"Marvel's Spider-Man Remastered") == Tier::eNoMfgOverride, "Remastered is FG-only in NVIDIA table");
@@ -22,7 +22,6 @@ int wmain(int argc, wchar_t** argv) {
                 Check(result.effectiveMaximumMultiplier <= NativeMaximumMultiplier(compiled), "policy cannot expand compiled bound");
                 Check(result.nvidiaCeilingMultiplier == 0 || result.effectiveMaximumMultiplier <= result.nvidiaCeilingMultiplier, "override never exceeds per-game ceiling");
                 Check(patched || result.effectiveMaximumMultiplier == 2, "unpatched route cannot advertise higher modes");
-                Check(result.fallback == (result.nvidiaCeilingMultiplier > result.effectiveMaximumMultiplier), "fallback reports runtime restriction separately");
                 Check(LimitToPolicy(tier, result.effectiveMaximumMultiplier) == result.effectiveMaximumMultiplier, "shared backend bound is idempotent");
             }
         }

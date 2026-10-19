@@ -1,4 +1,5 @@
 #include "runtime_payload.h"
+#include "../sha256_util.h"
 #include "embedded_xess_programs.generated.h"
 #include "embedded_xess_shaders.generated.h"
 #include <bcrypt.h>
@@ -11,18 +12,9 @@
 
 namespace xess_payload {
 std::string Hash(std::span<const unsigned char> bytes) {
-    BCRYPT_ALG_HANDLE algorithm{}; BCRYPT_HASH_HANDLE hash{};
-    if(BCryptOpenAlgorithmProvider(&algorithm,BCRYPT_SHA256_ALGORITHM,nullptr,0)<0)throw std::runtime_error("hash_algorithm");
-    std::array<UCHAR,32> digest{};
-    NTSTATUS status=BCryptCreateHash(algorithm,&hash,nullptr,0,nullptr,0,0);
-    if(status>=0)status=BCryptHashData(hash,const_cast<PUCHAR>(bytes.data()),static_cast<ULONG>(bytes.size()),0);
-    if(status>=0)status=BCryptFinishHash(hash,digest.data(),static_cast<ULONG>(digest.size()),0);
-    if(hash)BCryptDestroyHash(hash);
-    BCryptCloseAlgorithmProvider(algorithm,0);
-    if(status<0)throw std::runtime_error("hash_failed");
-    std::string out;
-    for(UCHAR b:digest){char h[3];sprintf_s(h,"%02x",b);out+=h;}
-    return out;
+    sha256_util::Digest digest{};
+    if(!sha256_util::Compute(bytes.data(),bytes.size(),digest))throw std::runtime_error("hash_failed");
+    return sha256_util::LowerHex(digest);
 }
 std::span<const Asset> Assets() noexcept { return embedded::assets; }
 std::span<const unsigned char> Read(HMODULE module,const Asset& asset) {

@@ -1,5 +1,5 @@
 #include "ampere_gpu.cpp"
-#include "../ampere_publication/fixture.h"
+#include "fixture.h"
 
 namespace
 {

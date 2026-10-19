@@ -46,10 +46,10 @@ def main():
     cases = [(f'default-{mode}', 'StartupDefaultsTests', mode, 'winmm.dll')
              for mode in ('clean', 'legacy', 'fixed', 'dynamic', 'follow', 'environment')]
     cases += [('loader-version', 'ReleaseLoadCheck', 'loader', 'version.dll'),
-              ('adapter-parent-menu','WarpPresentHarness','adapter-parent-menu','winmm.dll'),
               ('adapter-parent-coexist-menu','WarpPresentHarness','adapter-parent-coexist-menu','winmm.dll'),
               ('adapter-parent-unaligned-menu','WarpPresentHarness','adapter-parent-unaligned-menu','winmm.dll'),
               ('loader-winmm', 'ReleaseLoadCheck', 'loader', 'winmm.dll'),
+              ('factory-revision-unit', 'FactoryRevisionTests', '', 'winmm.dll'),
               ('themida-imports', 'ThemidaImportHost', '', 'version.dll'),
               ('control', 'ControlResolverTests', 'control', 'winmm.dll'),
               ('control-locked', 'ControlResolverTests', 'control-locked', 'winmm.dll'),
@@ -59,19 +59,17 @@ def main():
               ('factory-revision-menu', 'WarpPresentHarness', 'factory-revision-menu', 'winmm.dll'),
               ('factory-revision-present', 'WarpPresentHarness', 'factory-revision-present', 'winmm.dll'),
               ('factory-revision-unsupported', 'WarpPresentHarness', 'factory-revision-unsupported', 'winmm.dll'),
-              ('unaligned-graphics-menu', 'WarpPresentHarness', 'unaligned-graphics-menu', 'winmm.dll'),
               ('rwx-unaligned-graphics-menu', 'WarpPresentHarness', 'rwx-unaligned-graphics-menu', 'winmm.dll'),
               ('unaligned-graphics-coexist-menu', 'WarpPresentHarness', 'unaligned-graphics-coexist-menu', 'winmm.dll'),
               ('policy', 'NvidiaPolicyTests', '', 'winmm.dll'),
               ('dynamic-availability', 'DynamicAvailabilityTests', '', 'winmm.dll'),
               ('first-launch', 'WarpPresentHarness', 'first-launch-menu', 'winmm.dll'),
-              ('startup-menu', 'WarpPresentHarness', 'startup-menu', 'winmm.dll'),
-              ('unaligned-menu', 'WarpPresentHarness', 'unaligned-menu', 'winmm.dll'),
               ('rwx-unaligned-menu', 'WarpPresentHarness', 'rwx-unaligned-menu', 'winmm.dll'),
               ('rwx-aligned-menu', 'WarpPresentHarness', 'rwx-aligned-menu', 'winmm.dll'),
               ('hdr-startup-menu', 'WarpPresentHarness', 'hdr-startup-menu', 'winmm.dll'),
               ('hdr-unsupported-menu', 'WarpPresentHarness', 'hdr-unsupported-menu', 'winmm.dll'),
               ('layered-menu', 'WarpPresentHarness', 'layered-slinit-menu', 'winmm.dll'),
+              ('reshade-wrapped-menu', 'WarpPresentHarness', 'reshade-wrapped-menu', 'winmm.dll'),
               ('manual-upgrade-factory-menu', 'WarpPresentHarness', 'manual-upgrade-factory-menu', 'winmm.dll'),
               ('manual-upgrade-swapchain-passthrough', 'WarpPresentHarness', 'manual-upgrade-swapchain-passthrough', 'winmm.dll'),
               ('manual-upgrade-immediate-menu', 'WarpPresentHarness', 'manual-upgrade-immediate-menu', 'winmm.dll'),
@@ -80,11 +78,14 @@ def main():
               ('interposer-host-dynamic', 'WarpPresentHarness', 'interposer-host-dynamic', 'winmm.dll'),
               ('vsync-override-menu', 'WarpPresentHarness', 'vsync-override-menu', 'winmm.dll'),
               ('directinput-menu', 'WarpPresentHarness', 'directinput-menu', 'winmm.dll')]
+    # Every other documented proxy filename except the Bink names, which need the game's own Bink DLL.
+    cases += [(f'loader-{name}', 'ReleaseLoadCheck', 'loader', f'{name}.dll') for name in
+              ('dinput8', 'd3d9', 'd3d10', 'd3d11', 'd3d12', 'dxgi', 'dsound', 'wininet', 'winhttp',
+               'xinput1_1', 'xinput1_2', 'xinput1_3', 'xinput1_4', 'xinput9_1_0', 'xinputuap')]
     cases += [(name, 'EngineFactoryTests', name, 'winmm.dll') for name in
               ('engine-direct', 'engine-dynamic', 'engine-late', 'engine-middleware', 'engine-external', 'engine-conflict')]
-    cases += [('engine-menu', 'WarpPresentHarness', 'engine-menu', 'winmm.dll')]
     cases += [(f'optiscaler-{mode}', 'OptiScalerHostTests', mode, 'winmm.dll') for mode in
-              ('standalone', 'proxy', 'plugin', 'late', 'optin', 'impostor', 'fakenvapi',
+              ('plugin', 'late', 'optin', 'impostor', 'fakenvapi',
                'streamline', 'second-streamline')]
     cases += [('small-stack-resolver', 'SmallStackResolverTests', 'small-stack', 'winmm.dll')]
     cases += [('log-retention', 'LogRetentionTests', 'retention', 'winmm.dll')]

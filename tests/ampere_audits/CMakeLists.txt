@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
-project(AmpereFontValidation LANGUAGES CXX)
+# RTX 30 audits on real data-only provider fixtures: font program, pointer publication and readback,
+# and the complete CUDA program builder.
+project(AmpereAudits LANGUAGES CXX)
 set(NATIVE "${CMAKE_CURRENT_SOURCE_DIR}/../../source/native")
 set(MFG_PROVIDER_FIXTURE "" CACHE FILEPATH "Exact real data-only provider fixture")
 set(MFG_FONT_PROVIDER_LIST "" CACHE FILEPATH "Text file containing audited real provider paths")
@@ -9,9 +11,9 @@ endif()
 set(COMMON "${NATIVE}/dlssg_provider_policy.cpp" "${NATIVE}/ampere_native_cache.cpp"
     "${NATIVE}/ampere_cuda_program.cpp" "${NATIVE}/ampere_mask_transform.cpp")
 add_executable(AmpereFontAudit font.cpp ${COMMON})
-add_executable(AmperePublicationAudit ../ampere_publication/publication.cpp ${COMMON})
-add_executable(AmperePublicationReadback ../ampere_publication/readback.cpp ${COMMON})
-add_executable(CudaProgramAudit ../provider_31091/cuda_program.cpp "${NATIVE}/ampere_cuda_program.cpp")
+add_executable(AmperePublicationAudit publication.cpp ${COMMON})
+add_executable(AmperePublicationReadback readback.cpp ${COMMON})
+add_executable(CudaProgramAudit cuda_program.cpp "${NATIVE}/ampere_cuda_program.cpp")
 foreach(target IN ITEMS AmpereFontAudit AmperePublicationAudit AmperePublicationReadback CudaProgramAudit)
     target_compile_features(${target} PRIVATE cxx_std_20)
     target_compile_definitions(${target} PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN

@@ -16,10 +16,8 @@ int wmain(int argc, wchar_t** argv)
             && ProfileForVersion({310, 9, 1}) == &k3109TemporalProfile, "310.9.0 and 310.9.1 keep the 310.9 profile");
         Require(!ProfileForVersion({310, 9, 15}) && !ProfileForVersion({310, 9, 17}) && !ProfileForVersion({310, 10, 0}),
             "neighbouring versions rejected");
-        Require(policy::IsSupportedVersion({310, 9, 16}) && !policy::IsAdaOnlyVersion({310, 9, 16})
-            && policy::IsSupportedAmpereVersion({310, 9, 16}), "310.9.16 eligible on Ada and the RTX 30 port");
-        Require(policy::IsSupportedAmpereVersion({310, 9, 1}) && policy::ImplementsPresetC({310, 9, 16})
-            && !policy::ImplementsPresetC({310, 9, 1}), "RTX 30 keeps 310.9.1; Preset C only from 310.9.16");
+        // Version eligibility and Preset C are static_asserts in dlssg_provider_policy.h.
+        Require(!policy::IsAdaOnlyVersion({310, 9, 16}), "310.9.16 is not limited to Ada, so the RTX 30 port admits it");
 
         policy::VersionTriplet oldVersion{}, newVersion{};
         Require(policy::ReadProviderVersion(argv[1], oldVersion) && oldVersion.major == 310 && oldVersion.minor == 9
@@ -90,6 +88,45 @@ int wmain(int argc, wchar_t** argv)
         Require(FindDescriptorEntry(newModule, newBytes, profile) == 0, "mutated midpoint fatbin rejected");
         sourceMutable[200] ^= 1;
         Require(FindDescriptorEntry(newModule, newBytes, profile) == entry, "original mapping restored");
+        auto* name = reinterpret_cast<char*>(ReadU64(descriptor));
+        const char originalName = name[0];
+        name[0] = '!';
+        Require(FindDescriptorEntry(newModule, newBytes, profile) == 0, "wrong midpoint descriptor name rejected");
+        name[0] = originalName;
+        auto* entryName = reinterpret_cast<char*>(ReadU64(descriptor + 24));
+        const char originalKernel = entryName[0];
+        entryName[0] = '!';
+        Require(FindDescriptorEntry(newModule, newBytes, profile) == 0, "wrong CUDA entry name rejected");
+        entryName[0] = originalKernel;
+        const uintptr_t midpointEntry = table[profile.temporalSlot];
+        table[profile.temporalSlot] = begin + newBytes;
+        Require(FindDescriptorEntry(newModule, newBytes, profile) == 0, "out-of-image descriptor rejected");
+        table[profile.temporalSlot] = midpointEntry;
+        Require(FindDescriptorEntry(newModule, newBytes, profile) == entry, "original mapping restored after name checks");
+        auto wrong = profile;
+        wrong.sourcePtxSha256 = "0000000000000000000000000000000000000000000000000000000000000000";
+        std::memcpy(fatbin.data(), source, static_cast<size_t>(profile.sourceFatbinBytes));
+        Require(!BuildTemporalFatbin(fatbin.data(), scratch.data(), wrong, outputBytes, failure)
+            && failure == Failure::eSourceIdentity, "wrong decompressed PTX identity rejected");
+        std::memcpy(fatbin.data(), source, static_cast<size_t>(profile.sourceFatbinBytes));
+        fatbin[16 + 28] = 119;
+        Require(!BuildTemporalFatbin(fatbin.data(), scratch.data(), profile, outputBytes, failure),
+            "wrong architecture layout rejected");
+
+        auto* sections = IMAGE_FIRST_SECTION(newImage.nt);
+        const auto count = newImage.nt->FileHeader.NumberOfSections;
+        auto* extra = sections + count;
+        Require(reinterpret_cast<uint8_t*>(extra + 1) <= newImage.base + newImage.nt->OptionalHeader.SizeOfHeaders,
+            "duplicate fixture section header capacity");
+        std::memset(extra, 0, sizeof(*extra));
+        std::memcpy(extra->Name, ".audit", 6);
+        extra->VirtualAddress = newBytes;
+        extra->Misc.VirtualSize = 4096;
+        extra->Characteristics = IMAGE_SCN_MEM_READ | IMAGE_SCN_CNT_INITIALIZED_DATA;
+        std::memcpy(newImage.base + newBytes, table, 26 * sizeof(uintptr_t));
+        newImage.nt->FileHeader.NumberOfSections++;
+        newImage.nt->OptionalHeader.SizeOfImage += 4096;
+        Require(FindDescriptorEntry(newModule, newBytes + 4096, profile) == 0, "ambiguous duplicate registration table rejected");
         std::cout << "ADA_310916_AUDIT_PASSED\n";
         return 0;
     }

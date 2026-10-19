@@ -1,18 +1,18 @@
 // OptiScaler mode against the exact release DLL. The OptiScaler stand-in
 // (OptiScalerHostFixture.dll copied to OptiScaler.dll) carries OptiScaler's
 // version-resource identity and NGX-facade export shape. Modes:
-//   standalone  RTXMFG alone: no OptiScaler mode, menu factories still wrapped.
-//   proxy       OptiScaler mapped first (sibling proxy), then RTXMFG.
 //   plugin      OptiScaler loads plugins\MFGUnlocker.asi from its DllMain and calls
 //               InitializeASI under the loader lock.
 //   late        RTXMFG first, OptiScaler mapped afterwards.
-//   optin       proxy layout with "optiScalerUi":"rtxmfg" in the saved control.
+//   optin       OptiScaler mapped first (sibling proxy), then RTXMFG, with
+//               "optiScalerUi":"rtxmfg" in the saved control.
 //   impostor    a non-OptiScaler caller invokes InitializeASI.
 //   fakenvapi   a game-folder nvapi64.dll that answers fakenvapi's interface.
-//   streamline  proxy layout; OptiScaler's private Streamline
+//   streamline  OptiScaler mapped first, then RTXMFG; OptiScaler's private Streamline
 //               (OptiScaler\streamline\sl.interposer.dll) loads before the
 //               game's interposer.
-//   second-streamline  RTXMFG alone; a second interposer loads after the game's.
+//   second-streamline  RTXMFG alone (no OptiScaler mode, menu factories still
+//               wrapped); a second interposer loads after the game's.
 // The two Streamline modes check that RTXMFG routes and detours only the
 // game's interposer and that calls never cross instances.
 // Every case writes a saved control with fixed/preset/V-Sync/Reflex/XeSS
@@ -205,7 +205,7 @@ int wmain(int argc, wchar_t** argv)
     const auto status = here / L"optiscaler.status.json";
     SetEnvironmentVariableW(L"RTX_MFG_CONFIG_PATH", config.c_str());
     SetEnvironmentVariableW(L"RTX_MFG_STATUS_PATH", status.c_str());
-    const bool known = mode == L"standalone" || mode == L"proxy" || mode == L"plugin"
+    const bool known = mode == L"plugin"
         || mode == L"late" || mode == L"optin" || mode == L"impostor" || mode == L"fakenvapi"
         || mode == L"streamline" || mode == L"second-streamline";
     if (!known || std::filesystem::exists(config)) return 2;
@@ -225,11 +225,11 @@ int wmain(int argc, wchar_t** argv)
 
     HMODULE rtxmfg = nullptr;
     HMODULE optiscaler = nullptr;
-    if (mode == L"standalone" || mode == L"second-streamline")
+    if (mode == L"second-streamline")
     {
         rtxmfg = LoadLibraryW(candidate.c_str());
     }
-    else if (mode == L"proxy" || mode == L"optin" || mode == L"streamline")
+    else if (mode == L"optin" || mode == L"streamline")
     {
         optiscaler = LoadLibraryW(host.c_str());
         rtxmfg = LoadLibraryW(candidate.c_str());
@@ -274,7 +274,7 @@ int wmain(int argc, wchar_t** argv)
     Check(GetProcAddress(rtxmfg, "InitializeASI") != nullptr, "candidate exports InitializeASI");
     Check(Query(rtxmfg).backendOwner == 1, "candidate owns the backend");
 
-    const bool expectHost = mode == L"proxy" || mode == L"plugin" || mode == L"late" || mode == L"optin"
+    const bool expectHost = mode == L"plugin" || mode == L"late" || mode == L"optin"
         || mode == L"streamline";
     const bool delegated = expectHost && mode != L"optin";
     const char* route = mode == L"plugin" ? "\"plugin\"" : mode == L"late" ? "\"late\""

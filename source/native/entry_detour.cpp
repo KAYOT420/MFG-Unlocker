@@ -1,4 +1,5 @@
 #include "entry_detour.h"
+#include "process_mitigations.h"
 
 #include <Windows.h>
 #include <MinHook.h>
@@ -111,25 +112,6 @@ bool QueryExecutableImage(void* address, size_t bytes,
     const uintptr_t region = reinterpret_cast<uintptr_t>(memory.BaseAddress);
     return begin >= region && begin <= UINTPTR_MAX - bytes
         && begin + bytes <= region + memory.RegionSize;
-}
-
-bool MitigationPolicySupported() noexcept
-{
-    PROCESS_MITIGATION_CONTROL_FLOW_GUARD_POLICY cfg{};
-    PROCESS_MITIGATION_USER_SHADOW_STACK_POLICY cet{};
-    if (!GetProcessMitigationPolicy(GetCurrentProcess(),
-            ProcessControlFlowGuardPolicy, &cfg, sizeof(cfg))
-        || !GetProcessMitigationPolicy(GetCurrentProcess(),
-            ProcessUserShadowStackPolicy, &cet, sizeof(cet)))
-        return false;
-
-    // Normal CFG is compatible with the direct branches and executable pages
-    // used here. Strict CFG/XFG and strict non-CET policies are rejected: a
-    // partially usable trampoline is worse than a clean pass-through route.
-    return !cfg.StrictMode && !cfg.EnableXfg
-        && !cet.EnableUserShadowStackStrictMode
-        && !cet.BlockNonCetBinaries
-        && !cet.BlockNonCetBinariesNonEhcont;
 }
 
 size_t ReplayBytes(Kind kind) noexcept
@@ -725,7 +707,7 @@ bool ValidateTarget(Slot& slot, DeferredOwnerRelease& release) noexcept
         SetFailure(slot, Failure::eOwnerMismatch);
         return false;
     }
-    if (!MitigationPolicySupported())
+    if (!HookMitigationsSupported())
     {
         SetFailure(slot, Failure::eUnsupportedMitigation);
         return false;
