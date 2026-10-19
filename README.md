@@ -17,7 +17,7 @@ If this mod helps you, [help me get through university on Ko-fi](https://ko-fi.c
 
 ## V1.6.0
 
-- **DLSS presets while you play.** DLSS Frame Generation presets
+- **Change DLSS presets while you play.** DLSS Frame Generation presets
   apply while Frame Generation runs (RTX 40). A new menu section shows whether DLSS Super
   Resolution or Ray Reconstruction is running and switches their presets live.
   See [Usage](#usage).
