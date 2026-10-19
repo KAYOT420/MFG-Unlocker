@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
 # RTX 30 audits on real data-only provider fixtures: font program, pointer publication and readback,
 # and the complete CUDA program builder.
-project(AmpereAudits LANGUAGES CXX)
+project(AmpereAudits LANGUAGES C CXX)
 set(NATIVE "${CMAKE_CURRENT_SOURCE_DIR}/../../source/native")
 set(MFG_PROVIDER_FIXTURE "" CACHE FILEPATH "Exact real data-only provider fixture")
 set(MFG_FONT_PROVIDER_LIST "" CACHE FILEPATH "Text file containing audited real provider paths")
@@ -9,7 +9,7 @@ if(NOT EXISTS "${MFG_PROVIDER_FIXTURE}" OR NOT EXISTS "${MFG_FONT_PROVIDER_LIST}
     message(FATAL_ERROR "Explicit provider fixture and provider list are required")
 endif()
 set(COMMON "${NATIVE}/dlssg_provider_policy.cpp" "${NATIVE}/ampere_native_cache.cpp"
-    "${NATIVE}/ampere_cuda_program.cpp" "${NATIVE}/ampere_mask_transform.cpp")
+    "${NATIVE}/ampere_cuda_program.cpp" "${NATIVE}/ampere_mask_transform.cpp" "${NATIVE}/third_party/minhook/src/hde/hde64.c")
 add_executable(AmpereFontAudit font.cpp ${COMMON})
 add_executable(AmperePublicationAudit publication.cpp ${COMMON})
 add_executable(AmperePublicationReadback readback.cpp ${COMMON})

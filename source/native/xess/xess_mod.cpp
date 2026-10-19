@@ -15,7 +15,10 @@
 #include "port/port_support.h"
 #include "port/model_port.h"
 #include "port/shader_port.h"
+#include "cuda/cuda_route.h"
+#include "embedded_xefg_cuda.generated.h"
 #include "host_unlock.h"
+#include "intel_native.h"
 #include "motion_fill.h"
 #include "hudless_match.h"
 #include "cadence_stats.h"
@@ -136,15 +139,19 @@ struct State
     std::unique_ptr<ModelPort> model;
     // dev.40: contexts OptiScaler's own code created (untracked; fgMutex / llMutex). dev.41:
     // each XeFG one keeps its device and generation for its plain pacing owner (HostInitFg).
-    struct HostContext { ComPtr<ID3D12Device> device; uint64_t generation{}; bool paced{}; };
+    struct HostContext { ComPtr<ID3D12Device> device; uint64_t generation{}; bool paced{}; bool nativeUnlocked{}; };
     std::map<xefg_swapchain_handle_t, HostContext> hostFg;
     std::set<xell_context_handle_t> hostLl;
     std::once_flag hostUnlockOnce;
+    std::once_flag hostIntelLogOnce;
+    std::once_flag hostIntelLlLogOnce;
     // dev.40/42: the frame-count unlock (fgMutex), applied once per process to the provider
     // image it names and kept for the process lifetime. Host contexts (dev.40) and, on the
     // 2x-model route, tracked contexts (dev.42) on that image share it.
     std::unique_ptr<xess_host_unlock::Unlock> unlock;
     HMODULE unlockFg{};
+    // #490 scene.1: XeFG's scene-change decision redirected with the unlock (detector off), process lifetime.
+    std::unique_ptr<xess_host_unlock::SceneDetour> scene;
     bool hostUnlocked{}, trackedUnlocked{};
     // dev.46: the ported model failed to publish; the 2x model serves the rest of the process.
     bool portRejected{};
@@ -429,6 +436,45 @@ constexpr const char* kReconstructionPrograms[] = {"3518243144275597942266", "35
     "351747859676298538780", "351747860775810166991", "3517111067725881270903", "3517111066626369642692",
     "35110677435103722760616", "35110677436203234388827"};
 
+// #490 scene.1: XeFG's scene-change decision while the detector is off (host_unlock.h SceneDetour). It always
+// answers no scene change.
+bool SceneDecisionOff(void*, const float*, const float*) noexcept
+{
+    return false;
+}
+
+// Under fgMutex, with the frame-count unlock's first application. Never throws: on any failure XeFG keeps its own
+// detector and the unlock stands.
+void ApplySceneDetector(State& state, HMODULE fg) noexcept
+{
+    try
+    {
+        std::wstring setting;
+        const bool off = optiscaler_host::XefgSceneDetectorOff(setting);
+        const auto fields = ",\"setting\":\""+escape(utf8(setting))+"\"";
+        if (!off)
+        {
+            WriteLog("scene_change_detector", "\"mode\":\"intel\",\"applied\":false"+fields);
+            return;
+        }
+        try
+        {
+            state.scene = std::make_unique<xess_host_unlock::SceneDetour>(fg, SceneDecisionOff);
+            char rva[16]{};
+            sprintf_s(rva, "0x%X", state.scene->Rva());
+            WriteLog("scene_change_detector", "\"mode\":\"off\",\"applied\":true,\"rva\":\""+std::string(rva)+
+                "\",\"family\":\""+xess_layout::Get(fg).family+"\",\"threshold_offset\":"+
+                std::to_string(state.scene->ThresholdOffset())+fields);
+        }
+        catch (const std::exception& error)
+        {
+            WriteLog("scene_change_detector", "\"mode\":\"off\",\"applied\":false,\"reason\":\""+escape(error.what())+
+                "\",\"fallback\":\"intel\""+fields);
+        }
+    }
+    catch (...) {}
+}
+
 // Under fgMutex. Applies the frame-count unlock on first use; later callers must name the
 // same provider image and the same 2x-model choice. Returns the applied site names as a JSON
 // string list body.
@@ -439,6 +485,7 @@ std::string AcquireUnlock(State& state, HMODULE fg, HMODULE ll, bool keep2xModel
         state.unlock = std::make_unique<xess_host_unlock::Unlock>(fg, ll, static_cast<uint8_t>(kGeneratedCapacity),
             keep2xModel);
         state.unlockFg = fg;
+        ApplySceneDetector(state, fg);
     }
     else if (state.unlockFg != fg) throw std::runtime_error("unlock_on_other_provider_image");
     else if (state.unlock->Keeps2xModel() != keep2xModel) throw std::runtime_error("unlock_model_site_mismatch");
@@ -518,11 +565,38 @@ void PreparePort(State& state)
     }
 }
 
+// V1.5.1 tensorcore.1: with the ported model published, its int8 conv layers run as CUDA kernels on the tensor
+// cores of RTX 20/30/40/50 GPUs, launched in XeFG's own command list (xess/cuda/cuda_route.h); other layers, other
+// GPUs and anything not established keep the DXIL port. OptiScaler.ini [XeFG] XeFGTensorCores = off turns it
+// off. Decided once per process, at the first XeFG creation on the port.
+void InstallTensorCores(HMODULE provider, ID3D12Device* device) noexcept
+{
+    try
+    {
+        static std::once_flag logOnce;
+        std::call_once(logOnce, [] { xefg_cuda::SetLog(&WriteLog); });
+        std::wstring setting;
+        if (!optiscaler_host::ReadXefgTensorCores(setting))
+        {
+            xefg_cuda::Disable("optiscaler_ini_off");
+            return;
+        }
+        const auto fatbin = xess_payload::Read(Self(), xefg_cuda::embedded::fatbin);
+        std::string reason;
+        xefg_cuda::Install(device, provider, fatbin, reason);
+    }
+    catch (const std::exception& error)
+    {
+        WriteLog("cuda_route", "\"state\":\"error\",\"reason\":\""+escape(error.what())+"\"");
+    }
+}
+
 void RestoreIdlePort(State& state)
 {
     // dev.48: a port published for OptiScaler's own XeFG stays (its contexts are untracked).
     // modelchoice.1: so does any port while an OptiScaler context lives on the image.
     if (!state.contexts.empty() || state.uncertainFgLifetime || state.hostPorted || !state.hostFg.empty()) return;
+    xefg_cuda::ForgetLayers();
     state.model.reset();
     state.shaders.reset();
 }
@@ -962,15 +1036,68 @@ xefg_swapchain_result_t HostCreateFg(State& state, ID3D12Device* device, xefg_sw
 {
     const bool intel = adapter_support::VendorOf(device) == adapter_support::kIntelVendor;
     if (!intel) ApplyHostUnlock(state);
-    const auto result = original.xefgSwapChainD3D12CreateContext(device, output);
+    bool ported{};
+    {
+        std::lock_guard lock(state.fgMutex);
+        ported = state.hostPorted && state.model;
+    }
+    if (!intel && ported) InstallTensorCores(NativeFgModule(), device);
+    auto result = original.xefgSwapChainD3D12CreateContext(device, output);
     std::lock_guard lock(state.fgMutex);
+    bool nativeUnlocked{};
+    if (intel && result == XEFG_SWAPCHAIN_RESULT_SUCCESS && *output)
+    {
+        intel_native::Receipt receipt;
+        std::string failure;
+        nativeUnlocked = intel_native::Prepare(NativeFgModule(), NativeLlModule(), *output, receipt, failure);
+        if (receipt.fg)
+            std::call_once(state.hostIntelLogOnce, [&] { LogSdkModule(receipt.fg, "intel_native_fg"); });
+        if (*receipt.llBinding)
+        {
+            // arcnative.3: the XeLL the driver binds, chosen by its own rule; nothing is loaded.
+            // The shared sink has a bounded line size, so the path is a separate record.
+            WriteLog("host_intel_native_xell_binding", "\"handle\":"+std::to_string(uintptr_t(*output))+
+                ",\"binding\":\""+receipt.llBinding+"\",\"libxell_version\":\""+std::to_string(receipt.llMajor)+"."+
+                std::to_string(receipt.llMinor)+"."+std::to_string(receipt.llPatch)+"\""+
+                ",\"igxell_loaded\":"+(receipt.igxellLoaded ? "true" : "false")+
+                ",\"gated\":"+(receipt.llGated ? "true" : "false"));
+            if (!receipt.llPath.empty())
+                WriteLog("host_intel_native_xell_module", "\"handle\":"+std::to_string(uintptr_t(*output))+
+                    ",\"path\":\""+escape(utf8(receipt.llPath))+"\"");
+        }
+        if (nativeUnlocked)
+        {
+            std::call_once(state.hostIntelLlLogOnce, [&] {
+                LogSdkModule(receipt.ll, "intel_native_ll");
+            });
+        }
+        WriteLog("host_intel_native_unlock", "\"handle\":"+std::to_string(uintptr_t(*output))+
+            ",\"applied\":"+(nativeUnlocked ? "true" : "false")+
+            ",\"model\":\"intel_native\",\"maximum\":"+std::to_string(receipt.maximum)+
+            ",\"fg_module\":"+std::to_string(uintptr_t(receipt.fg))+
+            ",\"ll_module\":"+std::to_string(uintptr_t(receipt.ll))+
+            ",\"fg_rva\":"+std::to_string(receipt.fgRva)+",\"ll_rva\":"+std::to_string(receipt.llRva)+
+            ",\"ll_binding\":\""+receipt.llBinding+"\""+
+            (failure.empty() ? "" : ",\"reason\":\""+escape(failure)+"\""));
+        if (failure == "native_rollback_failed_restart_required")
+        {
+            // Publication failed and stock restoration was not verified. Never
+            // hand this new context to the host for allocation/presentation.
+            const auto destroyed = original.xefgSwapChainDestroy(*output);
+            if (destroyed != XEFG_SWAPCHAIN_RESULT_SUCCESS) state.uncertainFgLifetime = true;
+            WriteLog("host_intel_native_abort", "\"destroy_result\":"+std::to_string(destroyed)+
+                ",\"restart_required\":true");
+            *output = nullptr;
+            result = XEFG_SWAPCHAIN_RESULT_ERROR_UNSUPPORTED;
+        }
+    }
     if (result == XEFG_SWAPCHAIN_RESULT_SUCCESS && *output && !state.contexts.contains(*output))
     {
-        state.hostFg[*output] = {device, ++state.generation, false};
+        state.hostFg[*output] = {device, ++state.generation, false, nativeUnlocked};
         state.retiredFg.erase(*output);
     }
     WriteLog("host_context_create", "\"result\":"+std::to_string(result)+",\"handle\":"+
-        std::to_string(uintptr_t(*output))+",\"unlocked\":"+(state.hostUnlocked ? "true" : "false")+
+        std::to_string(uintptr_t(*output))+",\"unlocked\":"+((intel ? nativeUnlocked : state.hostUnlocked) ? "true" : "false")+
         ",\"intel\":"+(intel ? "true" : "false"));
     // modelchoice.1: the status shows the model the host unlock applied (xessModelActive).
     Publish(state);
@@ -985,6 +1112,8 @@ xefg_swapchain_result_t HostCreateFg(State& state, ID3D12Device* device, xefg_sw
 // scenechange.1: OptiScaler.ini [XeFG] XeFGSceneChangeThreshold = 0..1 sets XeFG's scene-change sensitivity on
 // OptiScaler's XeFG (xefgSwapChainSetSceneChangeThreshold; XeFG's default is 0.7, lower = fewer interpolations
 // dropped as scene cuts on fast camera turns). Absent or auto leaves XeFG's own value; OptiScaler never sets it.
+// #490 scene.1: absent, auto or off now turn the detector off with the unlock (ApplySceneDetector); a threshold or
+// intel keeps Intel's detector.
 void ApplyHostSceneChangeThreshold(xefg_swapchain_handle_t handle)
 {
     float threshold{};
@@ -1005,6 +1134,60 @@ void ApplyHostSceneChangeThreshold(xefg_swapchain_handle_t handle)
         ",\"applied\":"+(result == XEFG_SWAPCHAIN_RESULT_SUCCESS ? "true" : "false")+",\"result\":"+std::to_string(result));
 }
 
+// flipmeter.1 (test build): NVIDIA driver flip metering for OptiScaler's XeFG on the plain owner
+// (sdk_pacing.h SetFlipMetering). Decided once per process, at the first host init that reaches the
+// pacing route: an NVIDIA adapter, the NVIDIA driver's own NVAPI (never a fakenvapi: OptiScaler's
+// DisableFlipMetering works through fakenvapi), and NvAPI_D3D12_SetFlipConfig (R570+). OptiScaler.ini
+// [XeFG] XeFGFlipMetering = off turns it off; XeFGFlipMeteringHotkey = on lets Page Up toggle it live
+// (V1.5.1: opt-in); XeFGFlipMeteringLeadUs (0..8000, default 2500) is how early an output inside a
+// metered batch goes.
+void ConfigureHostFlipMetering(ID3D12Device* device) noexcept
+{
+    static std::once_flag once;
+    try
+    {
+        std::call_once(once, [device] {
+            std::string reason;
+            sdk_pacing::SetFlipConfigFunction function{};
+            std::wstring setting, leadSetting, hotkeySetting;
+            const bool enabled = optiscaler_host::ReadXefgFlipMetering(setting);
+            const bool hotkey = optiscaler_host::ReadXefgFlipMeteringHotkey(hotkeySetting);
+            uint32_t leadUs = 2500;
+            uint32_t configuredLead{};
+            if (optiscaler_host::ReadXefgFlipMeteringLead(configuredLead, leadSetting)) leadUs = configuredLead;
+            else if (!leadSetting.empty()) reason = "invalid_lead_setting";
+            if (adapter_support::VendorOf(device) != adapter_support::kNvidiaVendor) reason = "not_nvidia";
+            else if (HMODULE nvapi = LoadLibraryExW(L"nvapi64.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32); !nvapi)
+                reason = "nvapi_missing";
+            else
+            {
+                // Stays mapped for the process, like nvidia_mfg_policy's lookup: OptiScaler's
+                // nvapi_QueryInterface detour lives on this mapping.
+                HMODULE pinned{};
+                GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                    reinterpret_cast<LPCWSTR>(nvapi), &pinned);
+                const auto query = reinterpret_cast<optiscaler_host::NvapiQueryInterface>(
+                    GetProcAddress(nvapi, "nvapi_QueryInterface"));
+                using Initialize = int (__cdecl*)();
+                if (!query) reason = "nvapi_query";
+                else if (optiscaler_host::IsFakeNvapi(nvapi, query)) reason = "fake_nvapi";
+                else if (const auto initialize = reinterpret_cast<Initialize>(query(0x0150e828u)); !initialize || initialize() != 0)
+                    reason = "nvapi_initialize";
+                else if (!(function = reinterpret_cast<sdk_pacing::SetFlipConfigFunction>(query(0xf3148c42u))))
+                    reason = "set_flip_config_missing";
+            }
+            sdk_pacing::SetFlipMetering(function, enabled, int64_t(leadUs)*1000);
+            sdk_pacing::SetFlipToggleHotkey(function && hotkey);
+            WriteLog("host_flip_metering", "\"resolved\":"+std::string(function ? "true" : "false")+
+                ",\"enabled\":"+(function && enabled ? "true" : "false")+",\"lead_us\":"+std::to_string(leadUs)+
+                ",\"setting\":\""+escape(utf8(setting))+"\",\"lead_setting\":\""+escape(utf8(leadSetting))+
+                "\",\"hotkey\":\""+(function && hotkey ? "page_up" : "off")+"\",\"hotkey_setting\":\""+
+                escape(utf8(hotkeySetting))+"\""+(reason.empty() ? "" : ",\"reason\":\""+reason+"\""));
+        });
+    }
+    catch (...) {}
+}
+
 template<class Initialize>
 xefg_swapchain_result_t HostInitFg(State& state, xefg_swapchain_handle_t handle, Initialize initialize)
 {
@@ -1023,10 +1206,26 @@ xefg_swapchain_result_t HostInitFg(State& state, xefg_swapchain_handle_t handle,
     std::string failure;
     const bool intel = adapter_support::VendorOf(host.device.Get()) == adapter_support::kIntelVendor;
     const HMODULE fg = NativeFgModule();
-    if (intel) failure = "intel_adapter";
+    if (intel)
+    {
+        // Intel's driver owns native pacing; the portable scheduler never attaches.
+        failure = "intel_native_pacer";
+        intel_native::Receipt receipt;
+        std::string readbackFailure;
+        const bool observed = intel_native::Readback(fg, handle, receipt, readbackFailure);
+        WriteLog("host_intel_native_init", "\"handle\":"+std::to_string(uintptr_t(handle))+
+            ",\"observed\":"+(observed ? "true" : "false")+
+            ",\"unlocked\":"+(host.nativeUnlocked ? "true" : "false")+
+            ",\"capacity\":"+std::to_string(receipt.capacity)+",\"active\":"+std::to_string(receipt.active)+
+            ",\"pending\":"+std::to_string(receipt.pending)+
+            (readbackFailure.empty() ? "" : ",\"reason\":\""+escape(readbackFailure)+"\""));
+    }
     else if (!fg) failure = "no_provider_module";
     else if (sdk_pacing::Install(fg, failure))
+    {
+        ConfigureHostFlipMetering(host.device.Get());
         host.paced = sdk_pacing::Register(handle, host.generation, host.device.Get(), failure);
+    }
     WriteLog("host_pacing_owner", "\"generation\":"+std::to_string(host.generation)+",\"handle\":"+
         std::to_string(uintptr_t(handle))+",\"registered\":"+(host.paced ? "true" : "false")+
         (failure.empty() ? "" : ",\"reason\":\""+escape(failure)+"\""));
@@ -1048,6 +1247,8 @@ xefg_swapchain_result_t HostDestroyFg(State& state, xefg_swapchain_handle_t hand
     const auto result = original.xefgSwapChainDestroy(handle);
     std::lock_guard lock(state.fgMutex);
     if (result == XEFG_SWAPCHAIN_RESULT_SUCCESS) state.hostFg.erase(handle);
+    // tensorcore.1: the provider released the destroyed contexts' pipeline states.
+    if (result == XEFG_SWAPCHAIN_RESULT_SUCCESS && state.hostFg.empty() && state.contexts.empty()) xefg_cuda::ForgetLayers();
     WriteLog("host_context_destroy", "\"generation\":"+std::to_string(generation)+",\"handle\":"+
         std::to_string(uintptr_t(handle))+",\"result\":"+std::to_string(result));
     return result;
@@ -1088,6 +1289,7 @@ xefg_swapchain_result_t Hook_xefgSwapChainD3D12CreateContext(ID3D12Device* devic
         state.display.adapter = VerifyAdapter(device);
         state.display.provider = utf8(ModulePath(state.fgModule).wstring());
         PreparePort(state);
+        if (state.model) InstallTensorCores(state.fgModule, device);
         auto context = std::make_unique<FgContext>();
         context->device = device;
         context->generation = ++state.generation;
@@ -1807,6 +2009,14 @@ xefg_swapchain_result_t Hook_xefgSwapChainSetLatencyReduction(xefg_swapchain_han
         std::lock_guard llLock(state.llMutex);
         if (state.retiredFg.contains(handle) || state.retiredLl.contains(static_cast<xell_context_handle_t>(latency))) return kInvalid;
         if (state.latency.contains(static_cast<xell_context_handle_t>(latency))) return XEFG_SWAPCHAIN_RESULT_ERROR_LATENCY_REDUCTION_UNSUPPORTED;
+        // arcnative.3: the driver chooses its XeLL here, read-only check that it is the one whose gate was raised.
+        if (const auto host = state.hostFg.find(handle); host != state.hostFg.end() && host->second.nativeUnlocked)
+        {
+            const std::string now = intel_native::DriverXellBinding(), published = intel_native::PublishedXellBinding();
+            WriteLog("host_intel_native_latency", "\"handle\":"+std::to_string(uintptr_t(handle))+
+                ",\"xell_handle\":"+std::to_string(uintptr_t(latency))+",\"binding\":\""+now+"\",\"published\":\""+
+                published+"\",\"matches\":"+(now == published ? "true" : "false"));
+        }
         return original.xefgSwapChainSetLatencyReduction(handle, latency);
     }
     if (context->closing || context->latency || context->hostLatency) return XEFG_SWAPCHAIN_RESULT_ERROR_WRONG_CALL_ORDER;

@@ -16,8 +16,10 @@ int wmain(int argc, wchar_t** argv)
             && ProfileForVersion({310, 9, 1}) == &k3109TemporalProfile, "310.9.0 and 310.9.1 keep the 310.9 profile");
         Require(!ProfileForVersion({310, 9, 15}) && !ProfileForVersion({310, 9, 17}) && !ProfileForVersion({310, 10, 0}),
             "neighbouring versions rejected");
-        // Version eligibility and Preset C are static_asserts in dlssg_provider_policy.h.
-        Require(!policy::IsAdaOnlyVersion({310, 9, 16}), "310.9.16 is not limited to Ada, so the RTX 30 port admits it");
+        Require(policy::IsSupportedVersion({310, 9, 16}) && !policy::IsAdaOnlyVersion({310, 9, 16})
+            && policy::IsSupportedAmpereVersion({310, 9, 16}), "310.9.16 eligible on Ada and the RTX 30 port");
+        Require(policy::IsSupportedAmpereVersion({310, 9, 1}) && policy::ImplementsPresetC({310, 9, 16})
+            && !policy::ImplementsPresetC({310, 9, 1}), "RTX 30 keeps 310.9.1; Preset C only from 310.9.16");
 
         policy::VersionTriplet oldVersion{}, newVersion{};
         Require(policy::ReadProviderVersion(argv[1], oldVersion) && oldVersion.major == 310 && oldVersion.minor == 9

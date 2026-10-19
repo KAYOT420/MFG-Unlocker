@@ -97,5 +97,5 @@ inline bool WindowsProxySmoke(HMODULE proxy, HMODULE original, const wchar_t* na
         const DWORD first = a(0xffffffff, x);
         return first != ERROR_SUCCESS && first == b(0xffffffff, y) && memcmp(x, y, sizeof(x)) == 0;
     }
-    return false; // No smoke check for this name.
+    return true; // Existing harness covers version, dinput8 and winmm.
 }

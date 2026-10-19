@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(RTX40MFGNative VERSION 1.5.0.937 LANGUAGES C CXX ASM_MASM)
+project(RTX40MFGNative VERSION 1.6.0.1010 LANGUAGES C CXX ASM_MASM)
 option(MFG_UNLOCK_OVERLAY_SKIP_GPU_WORK "Isolated comparison: keep proxies/input but skip UI GPU work" OFF)
 option(MFG_UNLOCK_NGX_CREATE_RESULT_DIAGNOSTICS "Bounded NGX runtime Create results without DRED or new hooks" OFF)
 option(MFG_UNLOCK_GPU_FAULT_CAPTURE "Isolated local DRED and NGX result diagnostics" OFF)
@@ -57,11 +57,13 @@ set(MFG_UNLOCK_CORE_SOURCES
     ampere_native_cache.cpp
     ampere_mask_transform.cpp
     ampere_backend.cpp
+    ampere_flip_metering.cpp
     ampere_wrapper_capacity.cpp
     ampere_provider_arch.cpp
     dlssg_provider_selection.cpp
     dlssg_provider_policy.cpp
     dlssg_preset.cpp
+    dlss_sr.cpp
     reflex_control.cpp
     vsync_control.cpp
     entry_detour.cpp
@@ -100,6 +102,12 @@ if(MFG_UNLOCK_BUILD_SINGLE_MODULE)
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
         generate_build_inputs.py proxy_exports.txt generated_sha256.json ui_color.frag
         "${IMGUI_ROOT}/backends/imgui_impl_dx12.cpp" "${GLSLANG_VALIDATOR}")
+    # Menu translations: every locale/<code>.po is validated and compiled in (locale/README.md).
+    execute_process(COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/generate_locale.py" generate
+        --locale "${CMAKE_CURRENT_SOURCE_DIR}/locale" --output "${MFG_GENERATED}"
+        COMMAND_ERROR_IS_FATAL ANY)
+    file(GLOB MFG_LOCALE_CATALOGS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/locale/*.po")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS generate_locale.py ${MFG_LOCALE_CATALOGS})
     include_directories("${MFG_GENERATED}")
     set(MFG_XESS_SOURCES)
     set(MFG_XESS_RESOURCES)
@@ -126,13 +134,30 @@ if(MFG_UNLOCK_BUILD_SINGLE_MODULE)
             --dxc "${MFG_DXC}" --source "${CMAKE_CURRENT_SOURCE_DIR}" --output "${MFG_GENERATED}"
             COMMAND_ERROR_IS_FATAL ANY)
         set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-            xess/generate_xess_shaders.py xess/port/splat_motion_aware.hlsl)
+            xess/generate_xess_shaders.py xess/port/splat_motion_aware.hlsl xess/port/unet_conv.hlsl)
+        # V1.5.1 tensorcore.1: the ported model's int8 layers as CUDA kernels (xess/cuda), compiled by the pinned
+        # CUDA Toolkit 13.2 nvcc in the build's MSVC toolset environment; the generator pins compiler and output.
+        set(MFG_CUDA_ROOT "" CACHE PATH "CUDA Toolkit 13.2 directory (bin/nvcc.exe) for the XeFG tensor-core kernels")
+        if(NOT EXISTS "${MFG_CUDA_ROOT}/bin/nvcc.exe")
+            message(FATAL_ERROR "Set MFG_CUDA_ROOT to the pinned CUDA Toolkit 13.2")
+        endif()
+        string(REGEX MATCH "VCToolsVersion=([0-9.]+)" MFG_VC_TOOLS_MATCH "${CMAKE_VS_GLOBALS}")
+        if(NOT CMAKE_MATCH_1 OR NOT CMAKE_GENERATOR_INSTANCE)
+            message(FATAL_ERROR "The XeFG tensor-core kernels need CMAKE_GENERATOR_INSTANCE and VCToolsVersion (build.ps1 sets both)")
+        endif()
+        execute_process(COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/xess/cuda/generate_cuda_layers.py"
+            --nvcc "${MFG_CUDA_ROOT}/bin/nvcc.exe" --vcvars "${CMAKE_GENERATOR_INSTANCE}/VC/Auxiliary/Build/vcvars64.bat"
+            --vcvars-ver "${CMAKE_MATCH_1}" --source "${CMAKE_CURRENT_SOURCE_DIR}" --output "${MFG_GENERATED}"
+            COMMAND_ERROR_IS_FATAL ANY)
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+            xess/cuda/generate_cuda_layers.py xess/cuda/xefg_cuda_layers.cu xess/cuda/xefg_cuda_params.h)
         # beta.8: XeSS MFG under OptiScaler only (no standalone route, Reflex bridge or Intel native control).
         set(MFG_XESS_SOURCES
             xess/xess_mod.cpp xess/universal_hooks.cpp xess/internal_api_guards.asm
             xess/sdk_pacing.cpp xess/game_profile.cpp xess/runtime_payload.cpp xess/xess_runtime.cpp
-            xess/host_unlock.cpp xess/motion_fill.cpp xess/hudless_match.cpp)
-        set(MFG_XESS_RESOURCES "${MFG_GENERATED}/embedded_xess_programs.rc" "${MFG_GENERATED}/embedded_xess_shaders.rc")
+            xess/host_unlock.cpp xess/intel_native.cpp xess/motion_fill.cpp xess/hudless_match.cpp xess/cuda/cuda_route.cpp)
+        set(MFG_XESS_RESOURCES "${MFG_GENERATED}/embedded_xess_programs.rc" "${MFG_GENERATED}/embedded_xess_shaders.rc"
+            "${MFG_GENERATED}/embedded_xefg_cuda.rc")
     endif()
 
     add_library(MfgSingleMinHook STATIC
@@ -166,7 +191,8 @@ if(MFG_UNLOCK_BUILD_SINGLE_MODULE)
     set(MFG_SINGLE_CORE_SOURCES ${MFG_UNLOCK_CORE_SOURCES})
     add_library(MfgSingleObjects OBJECT ${MFG_SINGLE_CORE_SOURCES}
         single_module.cpp single_overlay.cpp overlay_application_imports.cpp overlay_platform.cpp caller_scoped_import.cpp
-        overlay_dx12.cpp overlay_dxgi_proxy.cpp overlay_adapter_parent.cpp overlay_vulkan.cpp overlay_install.cpp reshade_frontend.cpp
+        overlay_dx12.cpp overlay_dxgi_proxy.cpp overlay_adapter_parent.cpp gpu_name_override.cpp overlay_vulkan.cpp overlay_install.cpp reshade_frontend.cpp
+        localization.cpp
         witcher_dots/geometry.cpp witcher_dots/shader_ir.cpp witcher_dots/shader_cache.cpp
         witcher_dots/game_profile.cpp witcher_dots/game_discovery.cpp
         witcher_dots/gpu_runtime.cpp witcher_dots/witcher_dots.cpp

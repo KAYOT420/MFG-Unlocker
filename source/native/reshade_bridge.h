@@ -5,6 +5,35 @@
 
 #include <cstdint>
 
+// One DLSS feature in the menu snapshot (V1.6.0): Super Resolution from the
+// dlssSr* status keys, Ray Reconstruction from dlssRr*. Presets: 0 game/driver,
+// SR 10..13 J..M, RR 4..6 D..F. Active/driver/hint values describe the game's
+// most recently evaluated feature; the live feature counts decide whether the
+// menu shows the SR or the RR controls.
+struct MfgUnlockDlssFeature
+{
+    uint32_t presetRequested = 0;
+    BOOL detected = FALSE;
+    BOOL running = FALSE;
+    uint32_t liveFeatures = 0;
+    uint32_t renderWidth = 0, renderHeight = 0, outputWidth = 0, outputHeight = 0;
+    int32_t quality = -1;
+    uint32_t gameHint = 0;
+    uint32_t activePreset = 0;
+    // dlss_sr::Unavailable for the selection on that feature (0 = live).
+    uint32_t liveSwitch = 0;
+    // The provider's one DRS preset read per session: seen, the driver's
+    // (NVIDIA app) value, answered "not set" for a selected preset, whether
+    // that value fixes the preset until a restart, and a cached driver value
+    // (which can coexist with a live selector hook).
+    BOOL drsObserved = FALSE;
+    BOOL driverPresetValid = FALSE;
+    uint32_t driverPreset = 0;
+    BOOL drsSuppressed = FALSE;
+    BOOL fixedByDriver = FALSE;
+    BOOL driverOverrideCached = FALSE;
+};
+
 struct MfgUnlockReShadeSnapshot
 {
     uint32_t structSize = sizeof(MfgUnlockReShadeSnapshot);
@@ -170,7 +199,7 @@ struct MfgUnlockReShadeSnapshot
     uint32_t ampereCandidateVersionBuild = 0;
     uint64_t ampereCreatedFeatures = 0;
     uint64_t ampereEvaluations = 0;
-    uint32_t gpuFamily = 0;
+    uint32_t gpuFamily = 0; // 0 unknown, 1 Ada, 2 Ampere, 3 conflict, 4 Turing RTX
     uint64_t gpuAdapterLuid = 0;
     uint32_t gpuSelectionFailure = 0;
 
@@ -214,5 +243,31 @@ struct MfgUnlockReShadeSnapshot
 
     // The provider implements Frame Generation Preset C (DLSS-G 310.9.16 and newer).
     BOOL dlssgPresetCAvailable = FALSE;
+
+    // Live preset switching (V1.6.0): dlssg_preset_switch::Unavailable, 0 when a
+    // saved preset replaces the running one. A backend without the field keeps
+    // restart-to-apply (2, provider).
+    uint32_t dlssgPresetLiveSwitch = 2;
+    BOOL dlssgPresetSwitching = FALSE;
+
+    // DLSS Super Resolution and Ray Reconstruction (V1.6.0).
+    MfgUnlockDlssFeature dlssSr{};
+    MfgUnlockDlssFeature dlssRr{};
+
+    // NGX graphics API of the FG pipeline, or of the device that selected the
+    // GPU before the first Create: 0 unknown, 1 D3D12, 2 Vulkan.
+    uint32_t graphicsApi = 0;
+
+    // V-Sync on Vulkan (vsync_control.h): the vsync* readback describes the
+    // game's live Vulkan swapchain, whose present mode (VkPresentModeKHR) is
+    // fixed at creation. vsyncVulkanHook: the creation wrapper is installed.
+    BOOL vsyncVulkanSwapchain = FALSE;
+    BOOL vsyncVulkanHook = FALSE;
+    uint32_t vsyncOriginalPresentMode = 0;
+    uint32_t vsyncSubmittedPresentMode = 0;
+
+    // Source of dlssFpsMilli: 0 unavailable, 1 present callback, 2 DXGI
+    // present count, 4 DLSS-G's own presented-frame count.
+    uint32_t fpsOutputSource = 0;
 };
 

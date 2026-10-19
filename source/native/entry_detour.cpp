@@ -44,6 +44,9 @@ constexpr std::array<uint8_t, 4> kDlssgPublicEntry{
     0x48, 0x83, 0xEC, 0x58};
 constexpr std::array<uint8_t, 5> kSlInitEntry{
     0x48, 0x89, 0x54, 0x24, 0x10};
+// slSetD3DDevice of the Streamline 2.14 interposer: mov [rsp+8], rbx.
+constexpr std::array<uint8_t, 5> kSlSetD3DDeviceEntry{
+    0x48, 0x89, 0x5C, 0x24, 0x08};
 
 struct Slot
 {
@@ -124,6 +127,7 @@ size_t ReplayBytes(Kind kind) noexcept
     case Kind::eNgxRuntimeD3D12CreateFeature:
     case Kind::eNgxRuntimeD3D12EvaluateFeature:
     case Kind::eSlInit:
+    case Kind::eOptiScalerSlSetD3DDevice:
         return 5;
     case Kind::eDlssgSetOptions:
     case Kind::eDlssgGetState:
@@ -158,6 +162,9 @@ bool EntryMatches(Kind kind, const uint8_t* entry) noexcept
     case Kind::eSlInit:
         return std::memcmp(entry, kSlInitEntry.data(),
             kSlInitEntry.size()) == 0;
+    case Kind::eOptiScalerSlSetD3DDevice:
+        return std::memcmp(entry, kSlSetD3DDeviceEntry.data(),
+            kSlSetD3DDeviceEntry.size()) == 0;
     default:
         // Generic Streamline internal entries deliberately use the relocation
         // path; no version-dependent byte pattern is guessed here.

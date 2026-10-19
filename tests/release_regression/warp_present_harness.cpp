@@ -14,9 +14,7 @@
 #include <sl.h>
 #define DIRECTINPUT_VERSION 0x0800
 #include <dinput.h>
-// Every case runs with a renderer DLL beside the executable that imports DXGI and D3D12 and is loaded before
-// the candidate, as in shipped games. Nothing here calls it; the linker keeps the import.
-#pragma comment(linker, "/INCLUDE:__imp_EngineCreateFactory")
+extern "C" __declspec(dllimport) HRESULT WINAPI EngineCreateFactory(unsigned,REFIID,void**);
 
 namespace
 {
@@ -259,7 +257,7 @@ std::string ReadStatusText(const std::filesystem::path& status)
     return std::string{std::istreambuf_iterator<char>(input), {}};
 }
 
-int RunPresentation(const wchar_t* dll, bool menuMode, uint32_t expectedTargets, bool raceStartup = false, bool coexist = false,bool dynamicFactory=false,bool streamlineStartup=false,bool wrapped=false,bool layered=false,bool reshadeWrapped=false,bool firstLaunch=false,bool unaligned=false,bool executableInputPages=false,unsigned hdrStartup=0,bool unalignedGraphics=false,bool adapterParent=false,bool legacyFactory=false,bool alignedInput=false)
+int RunPresentation(const wchar_t* dll, bool menuMode, uint32_t expectedTargets, bool raceStartup = false, bool coexist = false,bool dynamicFactory=false,bool streamlineStartup=false,bool wrapped=false,bool layered=false,bool reshadeWrapped=false,bool firstLaunch=false,bool unaligned=false,bool executableInputPages=false,unsigned hdrStartup=0,bool engineFactory=false,bool unalignedGraphics=false,bool adapterParent=false,bool legacyFactory=false,bool alignedInput=false)
 {
     HMODULE foreign=nullptr;
     using ForeignLookup=FARPROC(WINAPI*)(HMODULE,LPCSTR);
@@ -323,6 +321,12 @@ int RunPresentation(const wchar_t* dll, bool menuMode, uint32_t expectedTargets,
     HMODULE module = raceStartup ? LoadCandidate(dll) : nullptr;
     HMODULE interposer=nullptr;
     HMODULE deviceModule=nullptr;
+    ComPtr<IDXGIFactory2> engineCreated;
+    if(engineFactory){
+        if(!Check(SUCCEEDED(EngineCreateFactory(1,IID_PPV_ARGS(&engineCreated)))
+            && Status(module).factoryWrappersCreated==1 && Status(module).overlayInstallState==2,
+            "renderer DLL factory activates UI before any executable factory call"))return 1;
+    }
     if (raceStartup && !Check(module != nullptr, "candidate loaded before the first factory/device")) return 1;
     if(unaligned&&!unalignedGraphics){
         const auto status=std::filesystem::current_path()/L"RTXMFG-Universal.status.json";
@@ -418,7 +422,7 @@ int RunPresentation(const wchar_t* dll, bool menuMode, uint32_t expectedTargets,
     }
 
     if (!module) module = LoadCandidate(dll);
-    if (!Check(module != nullptr, "candidate DLL loads")) return 1;
+    if (!Check(module != nullptr, "candidate winhttp.dll loads")) return 1;
     // Invoke the ordinary imported API; never synchronize through private status.
     ComPtr<IDXGIFactory1> applicationFactory;
     ComPtr<IDXGIFactory> legacyApplicationFactory;
@@ -451,6 +455,9 @@ int RunPresentation(const wchar_t* dll, bool menuMode, uint32_t expectedTargets,
         if (installed.overlayInstallState != kStateActive) Sleep(1500); // Preserve failure diagnostics, never gates success.
         if (!Check(installed.overlayInstallState == kStateActive, "bounded hooks active"))
             return 1;
+        Check(installed.overlayActivatedTargets <= 5,
+            "only optional application input imports are published");
+        Check(installed.overlaySuspendedThreads == 0, "UI installation never suspended process threads");
     }
     // Use a real post-load factory. The old harness accidentally retained a
     // pre-install factory; shared-table changes masked that coverage error.
@@ -474,7 +481,8 @@ int RunPresentation(const wchar_t* dll, bool menuMode, uint32_t expectedTargets,
         using Factory=HRESULT(WINAPI*)(REFIID,void**);
         auto create=reinterpret_cast<Factory>(GetProcAddress(interposer,"CreateDXGIFactory1"));
         Check(create&&SUCCEEDED(create(IID_PPV_ARGS(&fixture.factory))),"Streamline exported factory gateway returns owned proxy");
-    }else if(legacyFactory)fixture.factory=reinterpret_cast<IDXGIFactory2*>(legacyApplicationFactory.Get());
+    }else if(engineFactory){fixture.factory=engineCreated;engineCreated.Reset();}
+    else if(legacyFactory)fixture.factory=reinterpret_cast<IDXGIFactory2*>(legacyApplicationFactory.Get());
     else Check(SUCCEEDED(applicationFactory.As(&fixture.factory)),"use intercepted application factory");
     Chain chain;
     if (coexist) {
@@ -486,9 +494,6 @@ int RunPresentation(const wchar_t* dll, bool menuMode, uint32_t expectedTargets,
             menuMode ? "flip-sequential swapchain created (menu content validation)"
                      : "flip-model swapchain created"))
         return 1;
-    // The first wrapped swapchain publishes the bounded USER32 input imports (4 today), never more.
-    const uint32_t inputImports = Status(module).overlayActivatedTargets;
-    Check(inputImports >= 1 && inputImports <= 5, "first swapchain publishes only the optional application input imports");
 
     if(hdrStartup){
         // GTA calls the public revision-4 method on its creation-return pointer
@@ -1113,6 +1118,60 @@ std::optional<PanelLayout> ReadPanel(const std::filesystem::path& path)
 // Dying Light: The Beast reads the mouse through DirectInput. dinput8 runs an
 // exclusive mouse through a low-level hook that consumes every event, so the
 // game window receives no button messages and the menu could not be clicked.
+// Pinned FPS readout: with [Overlay] PinnedFps=1 saved, the closed menu keeps
+// a readout in the top-left corner composited after the 7-second
+// startup hint is gone. The hint sits below the readout, so a point inside it
+// is the control: drawn first, the plain clear colour after the hint expires.
+int RunPinnedFps(const wchar_t* dll)
+{
+    wchar_t exe[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    const auto ini = std::filesystem::path(exe).parent_path() / L"RTX40MFG-UI.ini";
+    if (!Check(GetPrivateProfileIntW(L"Overlay", L"PinnedFps", 0, ini.c_str()) == 1,
+            "pinned FPS saved before startup")) return 1;
+    WarpFixture fixture;
+    if (!Check(fixture.Initialize(true), "WARP device, queue and factory created")) return 1;
+    RestoreForeground previousForeground;
+    TestWindow window(L"PinnedFps", 640, 480, GameWindowProc);
+    if (!Check(window.window != nullptr, "test window created")) return 1;
+    window.Show();
+    HMODULE module = LoadCandidate(dll);
+    if (!Check(module != nullptr, "candidate loads")) return 1;
+    ComPtr<IDXGIFactory1> applicationFactory;
+    if (!Check(SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&applicationFactory)))
+            && SUCCEEDED(applicationFactory.As(&fixture.factory)),
+            "application factory created through the menu's gateway"))
+        return 1;
+    Chain chain;
+    if (!Check(chain.Create(fixture, window.window, 640, 480, 2, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL)
+            && Status(module).swapchainWrappersCreated == 1,
+            "application swapchain wrapped by the menu"))
+        return 1;
+
+    float teal[4] = {0.10f, 0.60f, 0.60f, 1.0f};
+    const ULONGLONG start = GetTickCount64();
+    for (int frame = 0; frame < 6; ++frame) { RenderAndPresent(fixture, chain, teal); window.Pump(1); }
+    float readout[4]{}, hint[4]{};
+    Check(ReadCenter(fixture, chain, readout, 20, 18) && !PixelMatches(readout, teal),
+        "pinned FPS readout composited in the top-left corner");
+    Check(ReadCenter(fixture, chain, hint, 200, 50) && !PixelMatches(hint, teal),
+        "startup hint composited below the readout");
+    while (GetTickCount64() - start < 8500)
+    {
+        RenderAndPresent(fixture, chain, teal);
+        window.Pump(1);
+        Sleep(50);
+    }
+    for (int frame = 0; frame < 3; ++frame) RenderAndPresent(fixture, chain, teal);
+    Check(Status(module).overlayVisible == 0, "menu stays closed");
+    Check(ReadCenter(fixture, chain, hint, 200, 50) && PixelMatches(hint, teal),
+        "startup hint gone after 7 seconds");
+    Check(ReadCenter(fixture, chain, readout, 20, 18) && !PixelMatches(readout, teal),
+        "pinned FPS readout still composited with the menu closed");
+    Check(SUCCEEDED(fixture.device->GetDeviceRemovedReason()), "device healthy after presents");
+    return 0;
+}
+
 // This case acquires a real exclusive DirectInput mouse, then drags the menu
 // panel by its title bar with injected input: the cursor and the panel must
 // follow, and DirectInput must still read the mouse once the menu closes. The
@@ -1824,18 +1883,22 @@ int wmain(int argc, wchar_t** argv)
     const std::wstring mode = argv[1];
     const wchar_t* dll = argv[2];
     std::printf("mode=%ls dll=%ls\n", argv[1], dll);
-    if (mode == L"factory-revision-menu") return RunPresentation(dll,true,18,false,false,false,false,false,false,false,false,false,false,0,false,false,true);
-    if (mode == L"factory-revision-present") return RunPresentation(dll,false,18,false,false,false,false,false,false,false,false,false,false,0,false,false,true);
+    if (mode == L"factory-revision-menu") return RunPresentation(dll,true,18,false,false,false,false,false,false,false,false,false,false,0,false,false,false,true);
+    if (mode == L"factory-revision-present") return RunPresentation(dll,false,18,false,false,false,false,false,false,false,false,false,false,0,false,false,false,true);
     if (mode == L"factory-revision-unsupported") return RunLegacyFactoryUnsupported(dll);
-    if (mode == L"adapter-parent-coexist-menu") return RunPresentation(dll,true,18,true,true,false,false,false,false,false,false,false,false,0,false,true);
-    if (mode == L"adapter-parent-unaligned-menu") return RunPresentation(dll,true,18,true,false,false,true,false,false,false,false,true,false,0,true,true);
-    if (mode == L"rwx-unaligned-graphics-menu") return RunPresentation(dll,true,18,true,false,false,true,false,false,false,false,true,true,0,true);
-    if (mode == L"unaligned-graphics-coexist-menu") return RunPresentation(dll,true,18,true,true,false,true,false,false,false,false,true,false,0,true);
+    if (mode == L"adapter-parent-menu") return RunPresentation(dll,true,18,true,false,false,false,false,false,false,false,false,false,0,false,false,true);
+    if (mode == L"adapter-parent-coexist-menu") return RunPresentation(dll,true,18,true,true,false,false,false,false,false,false,false,false,0,false,false,true);
+    if (mode == L"adapter-parent-unaligned-menu") return RunPresentation(dll,true,18,true,false,false,true,false,false,false,false,true,false,0,false,true,true);
+    if (mode == L"unaligned-graphics-menu") return RunPresentation(dll,true,18,true,false,false,true,false,false,false,false,true,false,0,false,true);
+    if (mode == L"rwx-unaligned-graphics-menu") return RunPresentation(dll,true,18,true,false,false,true,false,false,false,false,true,true,0,false,true);
+    if (mode == L"unaligned-graphics-coexist-menu") return RunPresentation(dll,true,18,true,true,false,true,false,false,false,false,true,false,0,false,true);
+    if (mode == L"unaligned-menu") return RunPresentation(dll,true,18,true,false,true,false,false,false,false,false,true);
     if (mode == L"rwx-unaligned-menu") return RunPresentation(dll,true,18,true,false,true,false,false,false,false,false,true,true);
-    if (mode == L"rwx-aligned-menu") return RunPresentation(dll,true,18,true,false,true,false,false,false,false,false,true,true,0,false,false,false,true);
+    if (mode == L"rwx-aligned-menu") return RunPresentation(dll,true,18,true,false,true,false,false,false,false,false,true,true,0,false,false,false,false,true);
     if (mode == L"hdr-startup-menu") return RunPresentation(dll,true,18,true,false,false,false,false,false,false,false,false,false,1);
     if (mode == L"hdr-unsupported-menu") return RunPresentation(dll,true,18,true,true,false,false,true,false,false,false,false,false,2);
     if (mode == L"startup-menu") return RunPresentation(dll, true, 18, true);
+    if (mode == L"engine-menu") return RunPresentation(dll,true,18,true,false,false,false,false,false,false,false,false,false,0,true);
     if (mode == L"first-launch-menu") return RunPresentation(dll,true,18,true,false,false,false,false,false,false,true);
     if (mode == L"layered-slinit-menu") return RunPresentation(dll,true,18,true,true,false,true,true,true);
     if (mode == L"reshade-wrapped-menu") return RunPresentation(dll,true,18,true,true,false,true,true,false,true);
@@ -1846,6 +1909,7 @@ int wmain(int argc, wchar_t** argv)
     if (mode == L"interposer-host-menu") return RunInterposerHost(dll, true);
     if (mode == L"interposer-host-dynamic") return RunInterposerHost(dll, false);
     if (mode == L"vsync-override-menu") return RunVsyncOverride(dll);
+    if (mode == L"pinned-fps-menu") return RunPinnedFps(dll);
     if (mode == L"directinput-menu") return RunDirectInputMenu(dll);
     std::printf("unknown mode\n");
     return 2;

@@ -2,6 +2,7 @@
 #include "fault_capture.h"
 #include "gpu_selection_policy.h"
 #include "ampere_backend.h"
+#include "ampere_provider_arch.h"
 #include "adapter_vendor_kmt.h"
 #include "single_module.h"
 #include <d3d12.h>
@@ -79,6 +80,7 @@ bool Publish(Family candidate, uint64_t luid) noexcept
         wchar_t message[192]{};
         swprintf_s(message, L"Unified GPU selection: family=%s adapterLuid=0x%016llX",
             gSelection.family == Family::eAda ? L"Ada (SM89)"
+            : gSelection.family == Family::eTuring ? L"Turing RTX (SM75)"
             : gSelection.family == Family::eAmpere ? L"Ampere (SM86)"
             : L"conflict; restart required", gSelection.luid);
         if (auto log = gLog.load(std::memory_order_acquire)) log(message);
@@ -106,6 +108,8 @@ bool DeviceIdentity(void* source, ID3D12Device*& device, uint64_t& luid) noexcep
 Family Selected() noexcept { return gFamily.load(std::memory_order_acquire); }
 bool IsAda() noexcept { return Selected() == Family::eAda; }
 bool IsAmpere() noexcept { return Selected() == Family::eAmpere; }
+bool IsTuring() noexcept { return Selected() == Family::eTuring; }
+bool UsesTranslatedProgram() noexcept { return IsAmpere() || IsTuring(); }
 uint64_t AdapterLuid() noexcept { return gLuid.load(std::memory_order_acquire); }
 uint32_t AdapterVendor() noexcept { return gVendor.load(std::memory_order_acquire); }
 void SetLogCallback(midpoint_fix::LogCallback callback) noexcept
@@ -135,40 +139,72 @@ bool ObserveD3D12Device(void* source) noexcept
         return Publish(Family::eUnknown, luid);
     }
     Family candidate = Family::eUnknown;
-    if (gSelection.family != Family::eAmpere && midpoint_fix::ObserveD3D12Device(device))
+    if (!UsesTranslatedProgram() && midpoint_fix::ObserveD3D12Device(device))
         candidate = Family::eAda;
     else if (gSelection.family != Family::eAda && ampere_backend::ObserveD3D12Device(device))
-        candidate = Family::eAmpere;
+        candidate = ampere_gpu::IsTuring() ? Family::eTuring : Family::eAmpere;
     device->Release();
     return Publish(candidate, luid);
+}
+bool ObserveAdaD3D12Device(void* source) noexcept
+{
+    std::lock_guard lock(gSelectionMutex);
+    if (gSelection.family != Family::eUnknown)
+        return gSelection.family == Family::eAda;
+    ID3D12Device* device = nullptr;
+    uint64_t luid = 0;
+    if (!DeviceIdentity(source, device, luid) || !gSelection.Allows(luid))
+    {
+        if (device) device->Release();
+        return false;
+    }
+    const uint32_t vendor = VendorForLuid(luid);
+    // Only a verified Ada adapter is published here; anything else leaves the
+    // selection to the game's own device and Create boundaries.
+    const bool ada = (!vendor || vendor == kNvidiaVendor) && midpoint_fix::ObserveD3D12Device(device);
+    device->Release();
+    if (!ada) return false;
+    fault_capture::ObserveDevice(source);
+    gVendor.store(vendor, std::memory_order_release);
+    return Publish(Family::eAda, luid);
 }
 bool ObserveVulkanPhysicalDevice(void* device) noexcept
 {
     std::lock_guard lock(gSelectionMutex);
-    if (gSelection.family == Family::eAmpere || gSelection.family == Family::eConflict)
+    if (gSelection.family == Family::eConflict)
         return false;
-    const bool verified = midpoint_fix::ObserveVulkanPhysicalDevice(device);
-    return Publish(verified ? Family::eAda : Family::eUnknown,
-        verified ? midpoint_fix::AdapterLuid() : 0);
+    if (!UsesTranslatedProgram())
+    {
+        if (midpoint_fix::ObserveVulkanPhysicalDevice(device))
+            return Publish(Family::eAda, midpoint_fix::AdapterLuid());
+        // No RTX 30 in this system (NVAPI): the Ada-only selection is unchanged.
+        if (!ampere_provider_arch::Armed())
+            return Publish(Family::eUnknown, 0);
+    }
+    // The VkPhysicalDevice LUID goes through the same CUDA compute-capability
+    // verification as an RTX 30 D3D12 device.
+    if (gSelection.family != Family::eAda && ampere_backend::ObserveVulkanPhysicalDevice(device))
+        return Publish(ampere_gpu::IsTuring() ? Family::eTuring : Family::eAmpere, ampere_gpu::AdapterLuid());
+    return Publish(Family::eUnknown, 0);
 }
 bool AdapterVerified() noexcept
 {
     return IsAda() ? midpoint_fix::AdapterVerified()
-        : IsAmpere() && ampere_backend::AdapterVerified();
+        : UsesTranslatedProgram() && ampere_backend::AdapterVerified();
 }
 bool Ready() noexcept
 {
-    return IsAda() ? midpoint_fix::Ready() : IsAmpere() && ampere_backend::Ready();
+    return IsAda() ? midpoint_fix::Ready() : UsesTranslatedProgram() && ampere_backend::Ready();
 }
 bool PatchProvider(HMODULE module, const wchar_t* path) noexcept
 {
     return IsAda() ? midpoint_fix::PatchProvider(module, path)
-        : IsAmpere() && ampere_backend::PatchProvider(module, path);
+        : UsesTranslatedProgram() && ampere_backend::PatchProvider(module, path);
 }
 uint32_t FailureCode() noexcept
 {
     return IsAda() ? midpoint_fix::FailureCode()
-        : IsAmpere() ? ampere_backend::FailureCode()
+        : UsesTranslatedProgram() ? ampere_backend::FailureCode()
         : Selected() == Family::eConflict ? 201u : 200u;
 }
 }

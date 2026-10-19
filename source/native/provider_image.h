@@ -1,5 +1,6 @@
 #pragma once
-// Stateless reads of a mapped provider image, shared by the Ada midpoint fix and the RTX 30 backend.
+// Stateless reads of a mapped provider image, shared by the Ada midpoint fix and the RTX 30 backend,
+// and of a MinHook route (the overlay and GPU name detours).
 // SafeCopy/SafeRead tolerate unreadable addresses (SEH); the others assume validated bounds.
 #include <Windows.h>
 #include <cstdint>
@@ -98,6 +99,31 @@ inline uint64_t PackLuid(const LUID& luid) noexcept
 {
     return static_cast<uint64_t>(luid.LowPart)
         | (static_cast<uint64_t>(static_cast<uint32_t>(luid.HighPart)) << 32);
+}
+
+// The pinned x64 MinHook build writes an E9 jump to an FF25 relay inside its own
+// executable allocation. Returns that 14-byte relay only when `target` decodes to
+// it and it jumps exactly to `detour`; null for any other route.
+inline const unsigned char* MinHookRelay(const void* target, const void* detour) noexcept
+{
+    const auto* code = static_cast<const unsigned char*>(target);
+    if (code[0] != 0xE9) return nullptr;
+    int32_t displacement = 0;
+    std::memcpy(&displacement, code + 1, sizeof(displacement));
+    const auto* relay = code + 5 + displacement;
+    constexpr size_t kRelayBytes = 14;
+    MEMORY_BASIC_INFORMATION memory{};
+    if (VirtualQuery(relay, &memory, sizeof(memory)) != sizeof(memory)
+        || memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE
+        || (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS))
+        || !(memory.Protect & (PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE))
+        || memory.RegionSize < kRelayBytes
+        || reinterpret_cast<uintptr_t>(relay) - reinterpret_cast<uintptr_t>(memory.BaseAddress)
+            > memory.RegionSize - kRelayBytes) return nullptr;
+    constexpr unsigned char indirect[] = {0xFF, 0x25, 0, 0, 0, 0};
+    const void* destination = nullptr;
+    std::memcpy(&destination, relay + sizeof(indirect), sizeof(destination));
+    return !std::memcmp(relay, indirect, sizeof(indirect)) && destination == detour ? relay : nullptr;
 }
 
 }

@@ -1,7 +1,7 @@
 #pragma once
 // Shared helpers for the bounded-overlay regression harness. Every case runs
 // in a fresh child process against an exact, hash-recorded candidate DLL that
-// was copied under a proxy name (winmm.dll) next to the test executable.
+// was copied to winhttp.dll next to the test executable.
 #include "single_module_status.h"
 #include <Windows.h>
 #include <d3d12.h>

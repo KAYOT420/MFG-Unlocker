@@ -1,6 +1,6 @@
 #include "../runtime_payload.h"
 // Exact-build, process-local shader additions. Unknown keys use the provider's
-// original decoder and retain its native failure behavior; splat.1: a decoded
+// original decoder and retain its native failure behavior; splat.1, unet.1: a decoded
 // program identical to one RTXMFG replaces is swapped for RTXMFG's own shader.
 // Install before any context; retain programs and relay until after exact
 // context destruction.
@@ -177,7 +177,7 @@ public:
         // Embedded resources supply the exact same 54 verified byte arrays.
         // No external program directory is consulted by the game build.
         programs=xess_payload::LoadPrograms(payload);
-        // splat.1: our own splat shaders replace Intel's (proven byte-identical; always validated).
+        // splat.1, unet.1: our own splat and U-Net conv shaders replace Intel's (proven byte-identical; always validated).
         replacements=xess_payload::LoadReplacements(payload);
         // Search only free regions within the signed-rel32 range of this call.
         const auto callEnd=reinterpret_cast<uintptr_t>(site+5);

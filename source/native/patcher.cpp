@@ -11,6 +11,7 @@
 #include "ui_input_coherence.h"
 #if MFG_UNLOCK_XESS
 #include "xess/xess_mod.h"
+#include "xess/cuda/cuda_route.h"
 #endif
 #include "ampere_backend.h"
 #include "ampere_provider_arch.h"
@@ -20,11 +21,13 @@
 #include "ampere_gpu.h"
 #include "ampere_policy.h"
 #include "gpu_dispatch.h"
+#include "gpu_name_override.h"
+#include "ui_host.h"
 #include "gpu_selection_policy.h"
 #include "midpoint_fix.h"
 #include "early_provider_load.h"
 namespace gpu_backend = gpu_dispatch;
-inline bool UseAmpere() noexcept { return gpu_dispatch::IsAmpere(); }
+inline bool UseAmpere() noexcept { return gpu_dispatch::UsesTranslatedProgram(); }
 
 #include "dlssg_provider_policy.h"
 #include "dlssg_provider_selection.h"
@@ -34,9 +37,12 @@ inline bool UseAmpere() noexcept { return gpu_dispatch::IsAmpere(); }
 #include "reflex_control.h"
 #include "vsync_control.h"
 #include "optiscaler_host.h"
+#include "optiscaler_private_streamline_policy.h"
 #include "ngx_runtime_policy.h"
 #include "dlssg_preset.h"
+#include "dlss_sr.h"
 #include "dlssg_preset_policy.h"
+#include "dlssg_preset_switch_policy.h"
 #include "present_counter.h"
 #include "entry_detour.h"
 #include "protected_pointer.h"
@@ -94,6 +100,11 @@ using PFun_slSetVulkanInfoAbi = sl::Result(
 static_assert(offsetof(VulkanInfoPrefix, device) == 32);
 static_assert(offsetof(VulkanInfoPrefix, physicalDevice) == 48);
 
+// vkCreateDevice (VkResult; VkPhysicalDevice, create info, allocator, VkDevice*).
+using PFun_vkCreateDeviceAbi = int32_t WINAPI(void* physicalDevice, const void* createInfo,
+    const void* allocator, void** device);
+constexpr int32_t kVkErrorInitializationFailed = -3;
+
 FILE* gLog = nullptr;
 std::atomic<bool> gDesiredFollowGame{true};
 std::atomic<uint32_t> gDesiredMultiplier{2u};
@@ -124,8 +135,24 @@ std::atomic<uint64_t> gSlUpgradeInterfaceCalls{0};
 std::atomic<uint64_t> gSlUpgradeInterfaceWrapped{0};
 std::atomic<PFun_slSetD3DDevice*> gOriginalSlSetD3DDeviceEntry{nullptr};
 entry_detour::Handle gSlSetD3DDeviceEntryHandle{};
+// RTX 30 systems: the interposer's Vulkan device setup entries.
+std::atomic<PFun_slSetVulkanInfoAbi*> gOriginalSlSetVulkanInfoEntry{nullptr};
+entry_detour::Handle gSlSetVulkanInfoEntryHandle{};
+std::atomic<PFun_vkCreateDeviceAbi*> gOriginalSlVulkanCreateDevice{nullptr};
+entry_detour::Handle gSlVulkanCreateDeviceEntryHandle{};
 std::atomic<bool> gSlInitInstalledAtLoad{false};
 std::atomic<uint64_t> gSlSetD3DDeviceCalls{0};
+// OptiScaler's private interposer keeps its own slSetD3DDevice original; it is
+// never forwarded into the game's instance (see HookOptiScalerSlSetD3DDevice).
+std::atomic<PFun_slSetD3DDevice*> gOriginalOptiScalerSlSetD3DDevice{nullptr};
+entry_detour::Handle gOptiScalerSlSetD3DDeviceEntryHandle{};
+std::atomic<uint64_t> gOptiScalerSlSetD3DDeviceCalls{0};
+// Hooked from the loader notification, before OptiScaler can call its slInit;
+// whether the RTX 30 declaration was armed then; whether a private call has
+// taken the RTX 30 startup (optiscaler_private_streamline_policy.h).
+std::atomic<bool> gOptiScalerSlSetD3DDeviceAtLoad{false};
+std::atomic<bool> gOptiScalerSlSetD3DDeviceArmedAtLoad{false};
+std::atomic<bool> gOptiScalerPrivateAmpereAdmitted{false};
 // The game's sl.interposer.dll; the Streamline entry hooks serve only it.
 std::atomic<HMODULE> gHostInterposer{nullptr};
 using GetProcAddressFn = FARPROC (WINAPI*)(HMODULE, LPCSTR);
@@ -200,6 +227,12 @@ std::array<std::atomic<HMODULE>, 4> gAmpereFilteredWrappers{};
 std::atomic<NvapiQueryInterfaceFn> gWrapperNvapiQuery{nullptr};
 std::atomic<uint64_t> gWrapperNvapiFilters{0}, gFlipMeteringHidden{0};
 std::atomic<bool> gWrapperNvapiFilterInstalled{false}, gAmpereWrapperResolverRouted{false};
+// Flip-metering path: the wrapper's SetFlipConfig, forwarded through ObservedSetFlipConfig.
+using NvapiSetFlipConfigFn = int(__cdecl*)(void*, void*, void*, void*);
+std::atomic<NvapiSetFlipConfigFn> gWrapperSetFlipConfig{nullptr};
+std::atomic<uint64_t> gFlipMeteringForwarded{0};
+// A registered wrapper predates the V2 generation: the flip-metering path does not apply.
+std::atomic<bool> gFlipForwardBlocked{false};
 std::atomic<uint64_t> gNotInitializedRetryCount{0};
 std::atomic<uint64_t> gNgxCreateCalls{0};
 std::atomic<uint64_t> gNgxFrameGenerationCreateCalls{0};
@@ -236,6 +269,13 @@ std::atomic<bool> gFirstCreateMidpointReady{false};
 std::atomic<bool> gBackportReadyAtCreate{false};
 std::atomic<bool> gPipelineMayPredateDetour{false};
 std::atomic<bool> gRestartRequired{false};
+// V1.6.0 live DLSS-G preset switching. The phase and start tick change only
+// under gStreamlineCallMutex; the phase is read lock-free by status.
+std::atomic<uint32_t> gPresetSwitchPhase{
+    static_cast<uint32_t>(dlssg_preset_switch::Phase::eIdle)};
+uint64_t gPresetSwitchStartTick = 0;
+// The saved request whose switch failed; a restart applies it.
+std::atomic<uint32_t> gPresetSwitchFailedRequest{UINT32_MAX};
 std::atomic<bool> gDllNotificationRegistered{false};
 early_provider_load::Tracker<> gOutputPullMaskLoads;
 struct OutputPullMaskInitEvidence
@@ -291,7 +331,9 @@ std::atomic<bool> gAppliedUiRecompositionForced{false};
 std::atomic<uint64_t> gSetTagCalls{0};
 std::atomic<uint64_t> gSetTagForFrameCalls{0};
 std::atomic<uint32_t> gRealFpsMilli{0};
-std::atomic<uint32_t> gFpsOutputSource{0}; // 0 unavailable, 1 callback, 2 DXGI, 3 estimate.
+// 0 unavailable, 1 callback, 2 DXGI, 3 estimate (unused), 4 DLSS-G presented count.
+std::atomic<uint32_t> gFpsOutputSource{0};
+constexpr uint32_t kFpsOutputDlssgPresented = 4;
 std::atomic<uint32_t> gDlssFpsMilli{0};
 std::atomic<uint32_t> gFpsSampleWindowMs{0};
 std::atomic<uint64_t> gFpsSampleTick{0};
@@ -338,6 +380,10 @@ struct ControlConfig
     bool dynamic = false;
     uint32_t dynamicTargetFrameRate = 0;
     uint32_t dlssgPreset = 2;
+    // V1.6.0: DLSS Super Resolution preset (0 game/driver, 10..13 J..M)
+    // and Ray Reconstruction preset (0 game/driver, 4..6 D..F).
+    uint32_t dlssSrPreset = 0;
+    uint32_t dlssRrPreset = 0;
     uint32_t vsyncMode = 0;
     uint32_t reflexFrameLimitFps = 0;
     // XeSS MFG runs under OptiScaler only (beta.8); its menu owns the frame count. The model
@@ -502,6 +548,11 @@ LARGE_INTEGER gFpsWindowStart{};
 uint64_t gFpsWindowOutputFrames = 0;
 bool gFpsWindowOutputAvailable = false;
 frame_telemetry::PresentCounter gFpsPresentCounter;
+// Every recorded GetState samples DLSS-G's presented count (gDlssgPresentedMutex);
+// the window copy is gFpsTelemetryMutex's.
+std::mutex gDlssgPresentedMutex;
+frame_telemetry::DlssgPresentedCounter gDlssgPresented;
+frame_telemetry::DlssgPresentedTotals gFpsWindowDlssgPresented;
 std::array<uint64_t, temporal_interval_trace::kFirstSampleHandleCapacity>
     gFpsWindowFirstSamples{};
 bool gFpsTelemetryActive = false;
@@ -533,6 +584,9 @@ bool InstallControlRouteLifecycleEntry(uint32_t routeSlot);
 bool TryInstallSlInitEntryDetour(HMODULE interposer, void* resolvedTarget);
 bool TryInstallSlUpgradeInterfaceEntryDetour(HMODULE interposer, void* resolvedTarget);
 bool TryInstallSlSetD3DDeviceEntryDetour(HMODULE interposer);
+bool TryInstallSlVulkanEntryDetours(HMODULE interposer);
+bool TryInstallOptiScalerSlSetD3DDeviceEntryDetour(HMODULE interposer, const std::wstring& path);
+void* MappedExportAddress(HMODULE module, const char* expected) noexcept;
 void WINAPI BeforeNgxD3D12EvaluateFeature(void*, uintptr_t, const void*, void*, uintptr_t, uintptr_t, entry_detour::Handle, const void*) noexcept;
 void WINAPI BeforeNgxRuntimeD3D12EvaluateFeature(void*, uintptr_t, const void*, void*, uintptr_t, uintptr_t, entry_detour::Handle, const void*) noexcept;
 bool TryInstallNgxCreateEntryDetour(HMODULE provider, const std::wstring& path,
@@ -559,7 +613,7 @@ bool InstallStreamlineLoaderDiscovery(
     HMODULE module, const std::wstring& path);
 FARPROC AmpereWrapperNvapiView(HMODULE module, LPCSTR name, FARPROC resolved, const void* caller) noexcept;
 ModuleRecord InspectLoadedModule(HMODULE, const std::wstring&);
-void InspectAlreadyLoadedModules();
+bool InspectAlreadyLoadedModules();
 ampere_gpu::PreparationBoundary ResolveAmperePreparationBoundary(HMODULE, uint64_t) noexcept;
 bool AmperePreparationStillCurrent(HMODULE, const ampere_gpu::PreparationBoundary&) noexcept;
 void PrepareNgxInitialization(void* device, const entry_detour::Snapshot& entry,
@@ -588,6 +642,42 @@ sl::Result InvokeAmpereInit(PFun_slInit* original, const sl::Preferences& prefer
     ampere_backend::BeginInit();
     __try { return original(preferences, version); }
     __finally { ampere_backend::EndInit(); }
+}
+
+// RTX 30 Vulkan hosts start the Streamline plug-ins in slSetVulkanInfo (manual
+// hooking) or inside the interposer's own vkCreateDevice. Either call is the
+// startup bracket slSetD3DDevice is for D3D12.
+sl::Result InvokeAmpereVulkanSetup(PFun_slSetVulkanInfoAbi* original, const VulkanInfoPrefix& info)
+{
+    sl::Result result = sl::Result::eErrorNotInitialized;
+    ampere_backend::BeginStartup();
+    __try
+    {
+        InspectAlreadyLoadedModules();
+        result = original(info);
+        InspectAlreadyLoadedModules();
+    }
+    __finally { ampere_backend::EndStartup(result == sl::Result::eOk); }
+    return result;
+}
+
+int32_t InvokeAmpereVulkanDeviceCreation(PFun_vkCreateDeviceAbi* original, void* physicalDevice,
+    const void* createInfo, const void* allocator, void** device)
+{
+    int32_t result = kVkErrorInitializationFailed;
+    ampere_backend::BeginStartup();
+    __try
+    {
+        InspectAlreadyLoadedModules();
+        result = original(physicalDevice, createInfo, allocator, device);
+        // The interposer created the device on the verified adapter and then
+        // started its plug-ins on it; that VkDevice is the host's FG device.
+        if (result == 0 && device)
+            ampere_backend::ObserveVulkanDevice(*device, true);
+        InspectAlreadyLoadedModules();
+    }
+    __finally { ampere_backend::EndStartup(result == 0); }
+    return result;
 }
 
 sl::Result HookSlDLSSGGetState(const sl::ViewportHandle& viewport,
@@ -626,8 +716,10 @@ void LogAmpereArchitectureDetection(bool armed) noexcept
     if (!gLogReady.load(std::memory_order_acquire) || logged.exchange(true, std::memory_order_acq_rel))
         return;
     const auto declaration = ampere_provider_arch::Read();
-    Log(L"RTX 30 DLSS-G declaration: armed=%d gpuArchitecture=0x%X implementation=0x%X",
-        armed, declaration.gpuArchitecture, declaration.gpuImplementation);
+    // nvapiRedirected: ids another layer's NVAPI factory detour replaced
+    // (bit 2 = GetArchInfo under OptiScaler), taken from NVIDIA's own factory.
+    Log(L"RTX 30 DLSS-G declaration: armed=%d gpuArchitecture=0x%X implementation=0x%X nvapiRedirected=0x%X",
+        armed, declaration.gpuArchitecture, declaration.gpuImplementation, declaration.nvapiRedirected);
 }
 
 int32_t NvidiaProfileStatus(
@@ -878,6 +970,24 @@ void ResetFpsTelemetry() noexcept
     gFpsSampleTick.store(0, std::memory_order_release);
 }
 
+// The interval trace's real frames across every handle: a monotonic key for
+// the per-real-frame DLSS-G sample.
+uint64_t RealFrameCount(const temporal_interval_trace::Snapshot& trace) noexcept
+{
+    uint64_t total = 0;
+    for (const auto& counter : trace.firstSampleCounters)
+        total += counter.samples;
+    return total;
+}
+
+frame_telemetry::DlssgPresentedTotals ReadDlssgPresented() noexcept
+{
+    std::lock_guard lock(gDlssgPresentedMutex);
+    return gDlssgPresented.Totals();
+}
+
+// outputSource kFpsOutputDlssgPresented ignores outputFrames/outputAvailable:
+// the output is DLSS-G's own count of the window's real frames.
 void UpdateFpsTelemetryForOutputPresent(uint32_t outputFrames,
     bool outputAvailable, uint32_t outputSource)
 {
@@ -901,6 +1011,7 @@ void UpdateFpsTelemetryForOutputPresent(uint32_t outputFrames,
             gFpsWindowFirstSamples[index] =
                 intervalTrace.firstSampleCounters[index].samples;
         }
+        gFpsWindowDlssgPresented = ReadDlssgPresented();
         return;
     }
 
@@ -932,12 +1043,19 @@ void UpdateFpsTelemetryForOutputPresent(uint32_t outputFrames,
     const auto rateMilli = [&](uint64_t frames) {
         return frame_telemetry::RateMilli(frames, frequency, elapsedTicks);
     };
+    uint32_t dlssMilli = gFpsWindowOutputAvailable ? rateMilli(gFpsWindowOutputFrames) : 0u;
+    uint32_t source = gFpsWindowOutputAvailable ? outputSource : 0u;
+    if (outputSource == kFpsOutputDlssgPresented)
+    {
+        const auto presented = ReadDlssgPresented();
+        dlssMilli = frame_telemetry::DlssgPresentedRateMilli(gFpsWindowDlssgPresented,
+            presented, realFrames, frequency, elapsedTicks, now.QuadPart);
+        source = dlssMilli ? outputSource : 0u;
+        gFpsWindowDlssgPresented = presented;
+    }
     gRealFpsMilli.store(rateMilli(realFrames), std::memory_order_relaxed);
-    gDlssFpsMilli.store(gFpsWindowOutputAvailable
-        ? rateMilli(gFpsWindowOutputFrames) : 0u,
-        std::memory_order_relaxed);
-    gFpsOutputSource.store(gFpsWindowOutputAvailable ? outputSource : 0u,
-        std::memory_order_relaxed);
+    gDlssFpsMilli.store(dlssMilli, std::memory_order_relaxed);
+    gFpsOutputSource.store(source, std::memory_order_relaxed);
     gFpsSampleWindowMs.store(static_cast<uint32_t>(
         std::min<uint64_t>(UINT32_MAX,
             (elapsedTicks * 1000u + frequency / 2u) / frequency)),
@@ -1080,6 +1198,16 @@ void RecordDlssgStateResult(
     const uint32_t previous =
         gActualFramesPresented.exchange(state.numFramesActuallyPresented,
             std::memory_order_relaxed);
+    {
+        // The Vulkan DLSS FPS readout: one sample per real frame (present_counter.h).
+        const temporal_interval_trace::Snapshot trace = temporal_interval_trace::ReadSnapshot();
+        LARGE_INTEGER now{};
+        if (trace.initialized && trace.enabled && QueryPerformanceCounter(&now))
+        {
+            std::lock_guard lock(gDlssgPresentedMutex);
+            gDlssgPresented.Sample(RealFrameCount(trace), state.numFramesActuallyPresented, now.QuadPart);
+        }
+    }
     gDlssgStatus.store(static_cast<uint32_t>(state.status), std::memory_order_relaxed);
     if (state.structVersion >= sl::kStructVersion2)
         gNumFramesToGenerateMax.store(
@@ -1178,7 +1306,10 @@ bool AdapterVerifiedForApi(NgxGraphicsApi api) noexcept
 {
     if (UseAmpere())
     {
-        return api == NgxGraphicsApi::eD3D12 && gpu_backend::AdapterVerified();
+        // RTX 30 Vulkan: the VkPhysicalDevice the host set up verified the adapter.
+        return gpu_backend::AdapterVerified()
+            && (api == NgxGraphicsApi::eD3D12
+                || (api == NgxGraphicsApi::eVulkan && gVulkanAdapterVerified.load(std::memory_order_acquire)));
     }
     return gpu_backend::AdapterVerified()
         && (api != NgxGraphicsApi::eVulkan
@@ -1427,6 +1558,18 @@ bool TryParseControl(const char* data, size_t size, ControlConfig& control)
     if (FindJsonValue(content, "dlssgPreset", presetOffset)
         && !TryParseUnsigned(content, "dlssgPreset", 0, 3, parsed.dlssgPreset))
         return false;
+    // A letter this build does not offer selects the game/driver preset
+    // instead of rejecting every other saved option.
+    if (FindJsonValue(content, "dlssSrPreset", presetOffset)
+        && !TryParseUnsigned(content, "dlssSrPreset", 0, 0xFFFFFF, parsed.dlssSrPreset))
+        return false;
+    if (!dlss_sr::IsValidSelection(parsed.dlssSrPreset))
+        parsed.dlssSrPreset = dlss_sr::kGameOrDriver;
+    if (FindJsonValue(content, "dlssRrPreset", presetOffset)
+        && !TryParseUnsigned(content, "dlssRrPreset", 0, 0xFFFFFF, parsed.dlssRrPreset))
+        return false;
+    if (!dlss_sr::IsValidRrSelection(parsed.dlssRrPreset))
+        parsed.dlssRrPreset = dlss_sr::kGameOrDriver;
 
     size_t experimentalOffset = 0;
     size_t pacingOffset = 0;
@@ -1563,11 +1706,37 @@ ControlConfig EffectiveControl(const ControlConfig& saved) noexcept
     effective.dynamic = false;
     effective.dynamicTargetFrameRate = 0;
     effective.dlssgPreset = dlssg_preset::kGameOrDriver;
+    effective.dlssSrPreset = dlss_sr::kGameOrDriver;
+    effective.dlssRrPreset = dlss_sr::kGameOrDriver;
     effective.vsyncMode = 0;
     effective.reflexFrameLimitFps = 0;
     effective.dynamicExperimental56 = false;
     effective.generatedOnlyDebug = false;
     return effective;
+}
+
+// The DLSS SR preset uses the DLSS-G preset's NvAPI DRS read hook, installed
+// on RTX 40 only. The SR provider reads its DRS key when NGX initializes it, which
+// can come before anything selected a GPU family; the game's NGX device selects
+// RTX 40 here (ObserveAdaD3D12Device never selects RTX 30).
+bool InstallDlssSrDrsHook(ID3D12Device* device) noexcept
+{
+    if (!gpu_dispatch::IsAda() && gpu_dispatch::Selected() == gpu_dispatch::Family::eUnknown && device)
+        gpu_dispatch::ObserveAdaD3D12Device(device);
+    return gpu_dispatch::IsAda() && dlssg_preset::Prepare();
+}
+
+uint32_t ReadInitialDlssSrPreset() noexcept
+{
+    // The first DLSS SR Create can come before the worker published control.
+    try { return EffectiveControl(ReadInitialControl()).dlssSrPreset; }
+    catch (...) { return dlss_sr::kGameOrDriver; }
+}
+
+uint32_t ReadInitialDlssRrPreset() noexcept
+{
+    try { return EffectiveControl(ReadInitialControl()).dlssRrPreset; }
+    catch (...) { return dlss_sr::kGameOrDriver; }
 }
 
 uint32_t ReadInitialDlssgPreset() noexcept
@@ -1602,6 +1771,8 @@ uint64_t StoreControl(const ControlConfig& control)
     gVsyncMode.store(control.vsyncMode, std::memory_order_relaxed);
     gReflexFrameLimitFps.store(control.reflexFrameLimitFps, std::memory_order_relaxed);
     dlssg_preset::SetRequested(control.dlssgPreset);
+    dlss_sr::SetRequested(control.dlssSrPreset);
+    dlss_sr::SetRequestedRr(control.dlssRrPreset);
     gDynamicExperimental56.store(control.dynamicExperimental56, std::memory_order_relaxed);
     gGeneratedOnlyDebug.store(control.generatedOnlyDebug,
         std::memory_order_relaxed);
@@ -1745,9 +1916,15 @@ std::string XessStatusFragment(const ControlConfig& control)
         snapshot->framesPresented, snapshot->lastResult, snapshot->lastFrameGenResult,
         snapshot->providerEnabled ? "true" : "false",
         static_cast<unsigned long long>(snapshot->appFrames), snapshot->adapterVendor);
+    // tensorcore.1: the ported model's int8 layers on tensor cores (0 not decided, 1 active, 2 unavailable, 3 off).
+    const auto tensorCores = xefg_cuda::Snapshot();
     return numbers
         + std::string(",\"xessModel\":") + std::to_string(control.xessModel)
         + ",\"xessModelActive\":" + std::to_string(snapshot->modelActive)
+        + ",\"xessTensorCores\":" + std::to_string(static_cast<uint32_t>(tensorCores.state))
+        + ",\"xessTensorCoreLaunches\":" + std::to_string(std::min<uint64_t>(tensorCores.launches, UINT32_MAX))
+        + ",\"xessTensorCoreFallbacks\":" + std::to_string(std::min<uint64_t>(tensorCores.fallbacks, UINT32_MAX))
+        + ",\"xessTensorCoreReason\":\"" + JsonEscapeUtf8(tensorCores.reason) + "\""
         + ",\"xessRuntimeFailure\":\"" + JsonEscapeUtf8(snapshot->runtimeFailure)
         + "\",\"xessStatus\":\"" + JsonEscapeUtf8(snapshot->status)
         + "\",\"xessAdapter\":\"" + JsonEscapeUtf8(snapshot->adapter)
@@ -1985,6 +2162,67 @@ void DiscoverReflexModule()
     }
     for (const auto& record : modules)
         reflex_control::ObserveModule(record.module, record.path.c_str(), record.generation);
+}
+
+// Why a saved DLSS-G preset cannot replace the frozen one while the game runs
+// (V1.6.0); eNone when the next quiescent point (or one forced re-create) applies it.
+dlssg_preset_switch::Unavailable PresetSwitchUnavailableReason(uint32_t requested) noexcept
+{
+    using Unavailable = dlssg_preset_switch::Unavailable;
+    if (optiscaler_host::UiDelegated()) return Unavailable::eOptiScaler;
+    if (!gpu_dispatch::IsAda() && !UseAmpere()) return Unavailable::eGpu;
+    if (UseAmpere()) return Unavailable::eLegacyPreset;
+    const auto api = static_cast<NgxGraphicsApi>(gActiveNgxGraphicsApi.load(std::memory_order_acquire));
+    // The lifetime tracker covers the runtime D3D12 route only.
+    if (api != NgxGraphicsApi::eUnknown && api != NgxGraphicsApi::eD3D12) return Unavailable::eGraphicsApi;
+    if (!ampere_backend::ReadFrameGenerationLiveness().exact) return Unavailable::eTracker;
+    if (gRestartRequired.load(std::memory_order_acquire)
+        || gPipelineMayPredateDetour.load(std::memory_order_acquire)
+        || gProviderChangedAfterCreate.load(std::memory_order_acquire))
+        return Unavailable::eRestartRequired;
+    const auto provider = reinterpret_cast<HMODULE>(gActiveNgxProviderBase.load(std::memory_order_acquire));
+    if (provider ? !dlssg_preset::ProviderSupportsLiveSwitch(provider)
+            : !dlssg_preset::ReadProvidersSupportLiveSwitch())
+        return Unavailable::eProvider;
+    if (gPresetSwitchFailedRequest.load(std::memory_order_acquire) == requested) return Unavailable::eFailed;
+    return Unavailable::eNone;
+}
+
+// V1.6.0: DLSS Super Resolution detection and its preset selection.
+// Flat fields only (see ampere_status_fields.h).
+std::string DlssSrStatusFragment()
+{
+    const auto sr = dlss_sr::Read();
+    const auto field = [](std::string& text, const char* format, auto... values)
+    {
+        char buffer[256]{};
+        sprintf_s(buffer, format, values...);
+        text += buffer;
+    };
+    const auto boolean = [](bool value) { return value ? "true" : "false"; };
+    std::string text;
+    text.reserve(2048);
+    // One feature's view: SR fields keep their beta.2 names, RR uses dlssRr*.
+    const auto feature = [&](const char* prefix, uint32_t requested, bool detected, bool running,
+        uint32_t live, const dlss_sr::FeatureView& view, const dlss_sr::DrsView& drs)
+    {
+        field(text, ",\"%sPresetRequested\":%u,\"%sDetected\":%s,\"%sRunning\":%s,\"%sLiveFeatures\":%u",
+            prefix, requested, prefix, boolean(detected), prefix, boolean(running), prefix, live);
+        field(text, ",\"%sRenderWidth\":%u,\"%sRenderHeight\":%u,\"%sOutputWidth\":%u,\"%sOutputHeight\":%u",
+            prefix, view.keys.width, prefix, view.keys.height, prefix, view.keys.outWidth, prefix, view.keys.outHeight);
+        field(text, ",\"%sQuality\":%d,\"%sGameHint\":%u,\"%sActivePreset\":%u,\"%sLiveSwitch\":%u",
+            prefix, view.valid ? view.keys.perfQuality : -1, prefix, view.gameHint, prefix, view.activePreset,
+            prefix, static_cast<uint32_t>(view.unavailable));
+        field(text, ",\"%sDrsObserved\":%s,\"%sDriverPresetValid\":%s,\"%sDriverPreset\":%u,\"%sDrsSuppressed\":%s",
+            prefix, boolean(drs.observed), prefix, boolean(drs.driverValueValid), prefix, drs.driverValue,
+            prefix, boolean(drs.suppressed));
+        field(text, ",\"%sFixedByDriver\":%s,\"%sDriverOverrideCached\":%s",
+            prefix, boolean(drs.fixedByDriver), prefix, boolean(drs.overrideCached));
+    };
+    feature("dlssSr", sr.requested, sr.detected, sr.running, sr.counters.liveSr, sr.primary, sr.sr);
+    feature("dlssRr", sr.requestedRr, sr.rrDetected, sr.rayReconstructionRunning, sr.counters.liveRr,
+        sr.rrPrimary, sr.rr);
+    return text;
 }
 
 bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
@@ -2444,7 +2682,11 @@ bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
         static_cast<unsigned long long>(fpsAgeMs),
         gDlssgStatus.load(std::memory_order_relaxed),
         DynamicMfgCapabilityKnown() ? "true" : "false",
-        (UseAmpere() ? DynamicMfgSupported() : gDynamicMfgSupported.load(std::memory_order_relaxed)) ? "true" : "false",
+        // NVIDIA's Dynamic MFG is D3D12-only and the options path never applies
+        // it on Vulkan; the menu must not offer it there on any GPU.
+        (UseAmpere() ? DynamicMfgSupported() : gDynamicMfgSupported.load(std::memory_order_relaxed)
+            && gActiveNgxGraphicsApi.load(std::memory_order_acquire)
+                != static_cast<uint32_t>(NgxGraphicsApi::eVulkan)) ? "true" : "false",
         gFgVsyncSupportKnown.load(std::memory_order_relaxed) ? "true" : "false",
         gFgVsyncSupported.load(std::memory_order_relaxed) ? "true" : "false",
         gGameOptionsStructVersion.load(std::memory_order_relaxed),
@@ -2512,24 +2754,37 @@ bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
     std::string serialized(json, static_cast<size_t>(length));
     const size_t gpuClosing = serialized.rfind('}');
     if (gpuClosing == std::string::npos) return false;
-    char gpu[192]{};
+    // graphicsApi: the FG pipeline's NGX API once committed, otherwise the API
+    // whose device selected RTX 30 (1 D3D12, 2 Vulkan, 0 unknown).
+    uint32_t graphicsApi = gActiveNgxGraphicsApi.load(std::memory_order_acquire);
+    if (!graphicsApi && UseAmpere())
+        graphicsApi = static_cast<uint32_t>(ampere_backend::DeviceApi());
+    else if (!graphicsApi && gVulkanAdapterVerified.load(std::memory_order_acquire))
+        graphicsApi = static_cast<uint32_t>(NgxGraphicsApi::eVulkan);
+    char gpu[320]{};
     sprintf_s(gpu, ",\"product\":\"RTXMFG\",\"gpuFamily\":%u,\"gpuAdapterLuid\":%llu,\"gpuSelectionFailure\":%u,"
-        "\"gpuVendorId\":%u",
+        "\"gpuVendorId\":%u,\"graphicsApi\":%u",
         static_cast<uint32_t>(gpu_dispatch::Selected()),
         static_cast<unsigned long long>(gpu_dispatch::AdapterLuid()), gpu_dispatch::FailureCode(),
-        gpu_dispatch::AdapterVendor());
+        gpu_dispatch::AdapterVendor(), graphicsApi);
     serialized.insert(gpuClosing, gpu);
-    char presetStatus[512]{};
+    char presetStatus[1152]{};
     sprintf_s(presetStatus, ",\"dlssgPresetLatched\":%u,"
         "\"dlssgPresetSelectionFrozen\":%s,\"dlssgPresetRestartRequired\":%s,"
         "\"dlssgPresetObserved\":%u,\"dlssgPresetObservedValid\":%s,"
-        "\"dlssgPresetOverrideReadCount\":%llu,\"dlssgPresetCAvailable\":%s",
+        "\"dlssgPresetOverrideReadCount\":%llu,\"dlssgPresetCAvailable\":%s,"
+        "\"dlssgPresetLiveSwitch\":%u,\"dlssgPresetSwitching\":%s,\"fgLifetimeExact\":%s",
         preset.latched, preset.selectionFrozen ? "true" : "false",
         preset.restartRequired ? "true" : "false", preset.observedPreset,
         preset.observedPresetValid ? "true" : "false",
         static_cast<unsigned long long>(preset.overrideReads),
-        preset.presetCAvailable ? "true" : "false");
+        preset.presetCAvailable ? "true" : "false",
+        static_cast<uint32_t>(PresetSwitchUnavailableReason(preset.requested)),
+        gPresetSwitchPhase.load(std::memory_order_acquire)
+            == static_cast<uint32_t>(dlssg_preset_switch::Phase::eDraining) ? "true" : "false",
+        ampere_backend::ReadFrameGenerationLiveness().exact ? "true" : "false");
     serialized.insert(serialized.rfind('}'), presetStatus);
+    serialized.insert(serialized.rfind('}'), DlssSrStatusFragment());
     const auto vsync = vsync_control::ReadSnapshot();
     const auto reflex = reflex_control::ReadSnapshot();
     char pacing[2048]{};
@@ -2537,6 +2792,8 @@ bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
         "\"dynamicVsyncAvailable\":%s,\"vsyncControlAvailable\":%s,"
         "\"vsyncOverrideApplied\":%s,\"vsyncPresentationObserved\":%s,"
         "\"vsyncOriginalInterval\":%u,\"vsyncSubmittedInterval\":%u,\"vsyncFailure\":%u,"
+        "\"vsyncVulkanSwapchain\":%s,\"vsyncVulkanHook\":%s,"
+        "\"vsyncOriginalPresentMode\":%u,\"vsyncSubmittedPresentMode\":%u,"
         "\"reflexControlAvailable\":%s,\"reflexAppliedKnown\":%s,"
         "\"reflexAppliedFrameLimitUs\":%u,\"reflexLimitPending\":%s,"
         "\"reflexRestorePending\":%s,\"reflexStatus\":%u,\"reflexLastResult\":%u,"
@@ -2548,6 +2805,8 @@ bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
         vsync.available ? "true" : "false", vsync.overrideApplied ? "true" : "false",
         vsync.matched ? "true" : "false", vsync.originalInterval, vsync.submittedInterval,
         static_cast<uint32_t>(vsync.failure),
+        vsync.vulkanSwapchain ? "true" : "false", vsync.vulkanHook ? "true" : "false",
+        vsync.originalPresentMode, vsync.submittedPresentMode,
         reflex.eligible && reflex.cachedPointersCovered && reflex.availabilityKnown
             && reflex.lowLatencyAvailable ? "true" : "false",
         reflex.appliedKnown ? "true" : "false", reflex.appliedFrameLimitUs,
@@ -2572,6 +2831,14 @@ bool WriteBridgeStatus(const ControlConfig& control, DWORD pid)
                 L"CPU-paced presentation keeps one output per generated frame",
                 static_cast<unsigned long long>(gWrapperNvapiFilters.load(std::memory_order_relaxed)),
                 static_cast<unsigned long long>(gFlipMeteringHidden.load(std::memory_order_relaxed)));
+        static std::atomic<bool> flipMeteringForwardedReported{false};
+        if (gFlipMeteringForwarded.load(std::memory_order_relaxed)
+            && !flipMeteringForwardedReported.exchange(true, std::memory_order_acq_rel))
+            Log(L"Ampere flip metering forwarded to the DLSS-G wrapper: dispatchers=%llu forwarded=%llu "
+                L"observing=%d; repeated outputs are admitted only while SetFlipConfig reports metering",
+                static_cast<unsigned long long>(gWrapperNvapiFilters.load(std::memory_order_relaxed)),
+                static_cast<unsigned long long>(gFlipMeteringForwarded.load(std::memory_order_relaxed)),
+                static_cast<int>(ampere_flip_metering::Observing()));
         const size_t closing = serialized.rfind('}');
         if (closing == std::string::npos) return false;
         const auto diagnostic = ampere_backend::Diagnostics();
@@ -2823,6 +3090,35 @@ bool AmpereFeatureEntriesCurrent(uintptr_t runtimeOwner, uint64_t runtimeGenerat
 {
     if (!runtimeOwner || !runtimeGeneration || !providerOwner || !providerGeneration)
         return false;
+    if (gActiveNgxGraphicsApi.load(std::memory_order_acquire)
+        == static_cast<uint32_t>(NgxGraphicsApi::eVulkan))
+    {
+        // RTX 30 Vulkan: Streamline enters Create1, or Create for older
+        // providers. Each module keeps one current entry per Create kind.
+        using entry_detour::Kind;
+        const auto entry = [](Kind kind, uintptr_t owner, uint64_t generation) noexcept {
+            const auto state = entry_detour::ReadSnapshot(kind, reinterpret_cast<HMODULE>(owner));
+            return state.current && state.currentEntries == 1 && state.generation == generation
+                ? state : entry_detour::Snapshot{};
+        };
+        const auto runtime1 = entry(Kind::eNgxRuntimeVulkanCreateFeature1, runtimeOwner, runtimeGeneration);
+        const auto runtime0 = entry(Kind::eNgxRuntimeVulkanCreateFeature, runtimeOwner, runtimeGeneration);
+        const auto provider1 = entry(Kind::eNgxVulkanCreateFeature1, providerOwner, providerGeneration);
+        const auto provider0 = entry(Kind::eNgxVulkanCreateFeature, providerOwner, providerGeneration);
+        if ((!runtime1.current && !runtime0.current) || (!provider1.current && !provider0.current))
+            return false;
+        const auto selected = entry_detour::ReadSnapshot(UnpackEntryHandle(
+            gActiveNgxCreateHandle.load(std::memory_order_acquire)));
+        if (!selected.current) return false;
+        switch (selected.kind)
+        {
+        case Kind::eNgxRuntimeVulkanCreateFeature1: return runtime1.current && selected.handle == runtime1.handle;
+        case Kind::eNgxRuntimeVulkanCreateFeature: return runtime0.current && selected.handle == runtime0.handle;
+        case Kind::eNgxVulkanCreateFeature1: return provider1.current && selected.handle == provider1.handle;
+        case Kind::eNgxVulkanCreateFeature: return provider0.current && selected.handle == provider0.handle;
+        default: return false;
+        }
+    }
     const auto runtime = entry_detour::ReadSnapshot(
         entry_detour::Kind::eNgxRuntimeD3D12CreateFeature,
         reinterpret_cast<HMODULE>(runtimeOwner));
@@ -3709,6 +4005,18 @@ bool RouteHasStateFunction(const ControlRouteRecord& route) noexcept
         || EntryOriginal(route.internalGetOriginal, route.internalGetHandle);
 }
 
+// A live preset switch keeps DLSS-G Off, without resource retention, until
+// Streamline has released every frame-generation feature (V1.6.0).
+void ApplyPresetSwitchOff(sl::DLSSGOptions& adjusted) noexcept
+{
+    if (gPresetSwitchPhase.load(std::memory_order_acquire)
+        != static_cast<uint32_t>(dlssg_preset_switch::Phase::eDraining))
+        return;
+    adjusted.mode = sl::DLSSGMode::eOff;
+    adjusted.flags = static_cast<sl::DLSSGFlags>(static_cast<uint32_t>(adjusted.flags)
+        & ~static_cast<uint32_t>(sl::DLSSGFlags::eRetainResourcesWhenOff));
+}
+
 template <typename SubmitOptions, typename QueryState>
 sl::Result SubmitAdjustedOptionsImpl(
     ControlRouteRecord& route, const sl::ViewportHandle& viewport,
@@ -3728,6 +4036,7 @@ sl::Result SubmitAdjustedOptionsImpl(
 
     sl::DLSSGOptions adjusted = BuildAdjustedOptions(
         source, snapshot, !liveReapply);
+    ApplyPresetSwitchOff(adjusted);
     bool dynamicOverrideApplied = dynamicRequested && DynamicMfgSupported();
     sl::Result result = submitOptions(adjusted);
     sl::Result acceptedResult = result;
@@ -3751,6 +4060,7 @@ sl::Result SubmitAdjustedOptionsImpl(
         const sl::DLSSGOptions acceptedFallback = adjusted;
         adjusted = BuildAdjustedOptions(
             source, snapshot, !liveReapply);
+        ApplyPresetSwitchOff(adjusted);
         dynamicOverrideApplied = true;
         result = submitOptions(adjusted);
         if (IsAcceptedControlResult(result))
@@ -3874,6 +4184,128 @@ sl::Result SubmitAdjustedOptions(
         }, hasState, expectedLiveFeature);
 }
 
+// Live DLSS-G preset switching (V1.6.0), on the game's own Streamline calls and
+// under gStreamlineCallMutex. With submit, this call sends the forced Off and
+// the game's options afterwards itself (GetState). Without it, the game's
+// SetOptions call that follows carries them (ApplyPresetSwitchOff).
+void AdvancePresetSwitch(const sl::ViewportHandle& viewport, bool submit)
+{
+    using namespace dlssg_preset_switch;
+    const auto phase = static_cast<Phase>(gPresetSwitchPhase.load(std::memory_order_acquire));
+    const auto selection = dlssg_preset::ReadSelection();
+    if (phase == Phase::eIdle && !selection.restartRequired)
+        return;
+    if (!gControlReady.load(std::memory_order_acquire)
+        || gGameFrameGenerationViewport.load(std::memory_order_acquire)
+            != static_cast<uint32_t>(viewport))
+        return;
+    ControlRouteRecord* route = ActiveControlRoute();
+    if (!route)
+        return;
+    sl::DLSSGOptions source{};
+    Inputs inputs{};
+    inputs.phase = phase;
+    inputs.pending = selection.restartRequired;
+    inputs.supported = PresetSwitchUnavailableReason(selection.requested) == Unavailable::eNone;
+    inputs.quiescent = ampere_backend::FrameGenerationQuiescent();
+    inputs.gameWantsOn = gGameFrameGenerationOn.load(std::memory_order_acquire);
+    inputs.optionsKnown = ReadLastGameOptions(viewport, source);
+    inputs.bridgeReady = BridgeReady();
+    const uint64_t now = GetTickCount64();
+    inputs.elapsedMs = phase == Phase::eDraining && now >= gPresetSwitchStartTick
+        ? now - gPresetSwitchStartTick : 0;
+    const auto resume = [&]() {
+        if (!submit || !inputs.gameWantsOn || !inputs.optionsKnown)
+            return;
+        // As the game's own call: Streamline creates a new feature, whose
+        // EndpointCore::Create reads the latched preset. Without a ready control
+        // route, pass the game's options as PassPublicSet does on RTX 40 (a live
+        // switch is never supported on RTX 30: eLegacyPreset).
+        sl::Result result = sl::Result::eErrorNotInitialized;
+        if (BridgeReady())
+            result = SubmitAdjustedOptions(*route, viewport, source, ReadControlSnapshot(), false);
+        else
+        {
+            result = CallRouteSetOptions(*route, viewport, source);
+            gLastSetOptionsResult.store(static_cast<int32_t>(result), std::memory_order_relaxed);
+            RecordSetOptionsLifecycle(*route, viewport, source.mode != sl::DLSSGMode::eOff, result);
+        }
+        if (!IsAcceptedControlResult(result))
+            Log(L"DLSS-G preset switch: frame generation On after the re-create failed: result=%d",
+                static_cast<int>(result));
+    };
+    const auto relatch = [&]() {
+        const auto before = dlssg_preset::ReadSelection();
+        if (!dlssg_preset::RelatchPending())
+            return false;
+        gPresetSwitchFailedRequest.store(UINT32_MAX, std::memory_order_release);
+        Log(L"DLSS-G preset switch: preset %u -> %u latched; configuration reset; awaiting configuration read",
+            before.latched, before.requested);
+        return true;
+    };
+    switch (Decide(inputs))
+    {
+    case Action::eNone:
+    case Action::eKeepDraining:
+        return;
+    case Action::eRelatch:
+        relatch();
+        return;
+    case Action::eBeginDrain:
+    {
+        gPresetSwitchStartTick = now;
+        gPresetSwitchPhase.store(static_cast<uint32_t>(Phase::eDraining), std::memory_order_release);
+        const auto liveness = ampere_backend::ReadFrameGenerationLiveness();
+        Log(L"DLSS-G preset switch: preset %u -> %u; frame generation Off without resource retention "
+            L"until %u live feature(s) are released", selection.latched, selection.requested,
+            liveness.liveFeatures);
+        if (!submit)
+            return;
+        const sl::Result result = SubmitAdjustedOptions(*route, viewport, source, ReadControlSnapshot(), true);
+        if (IsAcceptedControlResult(result))
+            return;
+        // Nothing changed: the game's feature keeps running with the old preset.
+        gPresetSwitchPhase.store(static_cast<uint32_t>(Phase::eIdle), std::memory_order_release);
+        gPresetSwitchFailedRequest.store(selection.requested, std::memory_order_release);
+        Log(L"DLSS-G preset switch: Off was refused (result=%d); preset %u applies after a restart",
+            static_cast<int>(result), selection.requested);
+        return;
+    }
+    case Action::eRelatchAndResume:
+        if (!relatch())
+        {
+            // A temporary endpoint/VRAM estimate may hold the gate. Keep Off
+            // while retrying, bounded by the same drain timeout. A refusal must
+            // never turn into repeated Off/On cycles or a reported success.
+            if (inputs.elapsedMs < kDrainTimeoutMs && inputs.supported) return;
+            gPresetSwitchFailedRequest.store(selection.requested, std::memory_order_release);
+            Log(L"DLSS-G preset switch: features released but the latch was refused; preset %u stays saved",
+                selection.requested);
+        }
+        gPresetSwitchPhase.store(static_cast<uint32_t>(Phase::eIdle), std::memory_order_release);
+        resume();
+        return;
+    case Action::eResume:
+        gPresetSwitchPhase.store(static_cast<uint32_t>(Phase::eIdle), std::memory_order_release);
+        Log(L"DLSS-G preset switch: selection returned to preset %u; frame generation resumes", selection.latched);
+        resume();
+        return;
+    case Action::eAbort:
+    {
+        gPresetSwitchPhase.store(static_cast<uint32_t>(Phase::eIdle), std::memory_order_release);
+        const auto liveness = ampere_backend::ReadFrameGenerationLiveness();
+        // A game that turned frame generation off itself retries at its next On.
+        if (inputs.gameWantsOn)
+            gPresetSwitchFailedRequest.store(selection.requested, std::memory_order_release);
+        Log(L"DLSS-G preset switch: %u feature(s) still live (%u Create(s) in flight) after %llu ms; "
+            L"preset %u applies after a restart", liveness.liveFeatures, liveness.createsInFlight,
+            static_cast<unsigned long long>(inputs.elapsedMs), selection.requested);
+        resume();
+        return;
+    }
+    }
+}
+
 void ReapplyPendingControl(const sl::ViewportHandle& viewport)
 {
     if (!gControlReady.load(std::memory_order_acquire)
@@ -3881,6 +4313,9 @@ void ReapplyPendingControl(const sl::ViewportHandle& viewport)
         || gGameFrameGenerationViewport.load(std::memory_order_acquire)
             != static_cast<uint32_t>(viewport)
         || gRestartRequired.load(std::memory_order_acquire)
+        // A live preset switch owns the submissions until its re-create.
+        || gPresetSwitchPhase.load(std::memory_order_acquire)
+            != static_cast<uint32_t>(dlssg_preset_switch::Phase::eIdle)
         || !BridgeReady())
         return;
 
@@ -3974,6 +4409,8 @@ bool SameMfgControl(const ControlConfig& left,
         && left.dynamic == right.dynamic
         && left.dynamicTargetFrameRate == right.dynamicTargetFrameRate
         && left.dlssgPreset == right.dlssgPreset
+        && left.dlssSrPreset == right.dlssSrPreset
+        && left.dlssRrPreset == right.dlssRrPreset
         && left.vsyncMode == right.vsyncMode
         && left.reflexFrameLimitFps == right.reflexFrameLimitFps
         && left.dynamicExperimental56 == right.dynamicExperimental56
@@ -4091,12 +4528,20 @@ bool ResolveUniqueHookedProvider(NgxGraphicsApi api, HMODULE& provider,
     HMODULE candidate = nullptr;
     std::wstring candidatePath;
     uint32_t candidateCount = 0;
+    // RTX 30 Vulkan: a provider counts once the Ampere route prepared its SM86
+    // program and covers its Vulkan entries (ngxPatched follows the first
+    // Create there). That check takes the Ampere lock, so it runs after the
+    // module lock is released.
+    const bool ampereVulkan = UseAmpere() && api == NgxGraphicsApi::eVulkan;
+    std::array<HMODULE, 8> ampereModules{};
+    std::array<std::wstring, 8> amperePaths{};
+    size_t ampereCount = 0;
     {
         std::lock_guard lock(gModuleMutex);
         for (const auto& record : gModuleRecords)
         {
             if (!record.ngxExport || !record.ngxCandidate
-                || !record.ngxPatched)
+                || (!ampereVulkan && !record.ngxPatched))
                 continue;
             const entry_detour::Kind createKind =
                 api == NgxGraphicsApi::eVulkan
@@ -4124,11 +4569,29 @@ bool ResolveUniqueHookedProvider(NgxGraphicsApi api, HMODULE& provider,
                 || selectedCreate.generation != record.generation
                 || evaluate.generation != record.generation)
                 continue;
+            if (ampereVulkan)
+            {
+                // More candidates than routes fail closed below.
+                if (ampereCount == ampereModules.size()) { ++candidateCount; continue; }
+                ampereModules[ampereCount] = record.module;
+                amperePaths[ampereCount++] = record.path;
+                continue;
+            }
             ++candidateCount;
             candidate = record.module;
             if (path)
                 candidatePath = record.path;
         }
+    }
+    for (size_t i = 0; i < ampereCount; ++i)
+    {
+        if (!ampere_backend::VulkanProviderPrepared(ampereModules[i])
+            || !dlssg_provider_policy::IsSupportedRetainedAmpereProvider(ampereModules[i]))
+            continue;
+        ++candidateCount;
+        candidate = ampereModules[i];
+        if (path)
+            candidatePath = amperePaths[i];
     }
     if (universal_route_policy::ResolveProvider(false, candidateCount)
         != universal_route_policy::ProviderResolution::eUniqueCandidate)
@@ -4483,15 +4946,25 @@ void BeforeNgxEvaluateFeatureForRoute(NgxDispatchRoute route,
         // The Ampere gate invokes this only inside an owned runtime operation.
         // Check the pinned entry identity without reopening the provider file on
         // every frame. Optional interval collection remains disabled by default.
+        // RTX 30 Vulkan uses the same nested provider observation.
+        const bool vulkan = api == NgxGraphicsApi::eVulkan;
+        const auto providerEvaluateKind = vulkan
+            ? entry_detour::Kind::eNgxVulkanEvaluateFeature : entry_detour::Kind::eNgxD3D12EvaluateFeature;
+        const auto runtimeEvaluateKind = vulkan
+            ? entry_detour::Kind::eNgxRuntimeVulkanEvaluateFeature : entry_detour::Kind::eNgxRuntimeD3D12EvaluateFeature;
+        const auto runtimeCreateKind = [vulkan](entry_detour::Kind kind) noexcept {
+            return vulkan ? kind == entry_detour::Kind::eNgxRuntimeVulkanCreateFeature
+                    || kind == entry_detour::Kind::eNgxRuntimeVulkanCreateFeature1
+                : kind == entry_detour::Kind::eNgxRuntimeD3D12CreateFeature;
+        };
         const auto verified = entry_detour::ReadSnapshot(entryHandle);
-        if (api != NgxGraphicsApi::eD3D12 || route != NgxDispatchRoute::eProvider
-            || !verified.current || verified.kind != entry_detour::Kind::eNgxD3D12EvaluateFeature
+        if ((api != NgxGraphicsApi::eD3D12 && !vulkan) || route != NgxDispatchRoute::eProvider
+            || !verified.current || verified.kind != providerEvaluateKind
             || verified.owner != ampere_gpu::Provider()
             || reinterpret_cast<uintptr_t>(verified.owner) != gActiveNgxProviderBase.load(std::memory_order_acquire)
             || verified.generation != gActiveNgxProviderGeneration.load(std::memory_order_acquire))
             return;
-        const auto providerEvaluate = entry_detour::ReadSnapshot(
-            entry_detour::Kind::eNgxD3D12EvaluateFeature, verified.owner);
+        const auto providerEvaluate = entry_detour::ReadSnapshot(providerEvaluateKind, verified.owner);
         const auto selected = entry_detour::ReadSnapshot(UnpackEntryHandle(
             gActiveNgxEvaluateHandle.load(std::memory_order_acquire)));
         if (!providerEvaluate.current || providerEvaluate.currentEntries != 1
@@ -4499,7 +4972,7 @@ void BeforeNgxEvaluateFeatureForRoute(NgxDispatchRoute route,
             return;
         if (active == static_cast<uint32_t>(NgxDispatchRoute::eProvider))
         {
-            if (selected.kind != entry_detour::Kind::eNgxD3D12EvaluateFeature
+            if (selected.kind != providerEvaluateKind
                 || selected.handle != entryHandle)
                 return;
         }
@@ -4508,15 +4981,14 @@ void BeforeNgxEvaluateFeatureForRoute(NgxDispatchRoute route,
             // Selection belongs to the outer runtime, while this observation
             // still comes only from the admitted nested provider entry. Never
             // record the outer callback or replace the selected route handle.
-            const auto runtimeEvaluate = entry_detour::ReadSnapshot(
-                entry_detour::Kind::eNgxRuntimeD3D12EvaluateFeature, selected.owner);
+            const auto runtimeEvaluate = entry_detour::ReadSnapshot(runtimeEvaluateKind, selected.owner);
             const auto create = entry_detour::ReadSnapshot(UnpackEntryHandle(
                 gActiveNgxCreateHandle.load(std::memory_order_acquire)));
-            if (selected.kind != entry_detour::Kind::eNgxRuntimeD3D12EvaluateFeature
+            if (selected.kind != runtimeEvaluateKind
                 || selected.owner != ModuleFromAddress(originalCaller)
                 || !runtimeEvaluate.current || runtimeEvaluate.currentEntries != 1
                 || runtimeEvaluate.handle != selected.handle
-                || !create.current || create.kind != entry_detour::Kind::eNgxRuntimeD3D12CreateFeature
+                || !create.current || !runtimeCreateKind(create.kind)
                 || create.owner != selected.owner || create.generation != selected.generation
                 || !AmpereFeatureEntriesCurrent(reinterpret_cast<uintptr_t>(selected.owner), selected.generation,
                     reinterpret_cast<uintptr_t>(verified.owner), verified.generation))
@@ -4725,6 +5197,22 @@ bool WINAPI VulkanCreateGate(void* argument1, uintptr_t argument2, const void* a
     const bool version1 = entry.kind == entry_detour::Kind::eNgxVulkanCreateFeature1
         || entry.kind == entry_detour::Kind::eNgxRuntimeVulkanCreateFeature1;
     const uintptr_t feature = version1 ? reinterpret_cast<uintptr_t>(argument3) : argument2;
+    if (UseAmpere())
+    {
+        // RTX 30: a runtime Create diverts to the Ampere route's thunk (this
+        // entry's rejected target); the nested provider Create is admitted by it.
+        const bool runtime = entry.kind == entry_detour::Kind::eNgxRuntimeVulkanCreateFeature
+            || entry.kind == entry_detour::Kind::eNgxRuntimeVulkanCreateFeature1;
+        if (runtime || !ampere_backend::VulkanProviderGate(argument1, argument2, argument3, argument4,
+                argument5, argument6, handle, caller))
+            return false;
+#if MFG_UNLOCK_OUTPUT_PULL_MASK_ONLY
+        // That build clears the entry's pre-call; run it after admission.
+        (version1 ? &BeforeNgxVulkanCreateFeature1 : &BeforeNgxVulkanCreateFeature)(argument1, argument2,
+            argument3, argument4, argument5, argument6, handle, caller);
+#endif
+        return true;
+    }
     if (!gpu_dispatch::AllowVulkanCreate(gpu_dispatch::Selected(),
             feature == NVSDK_NGX_Feature_FrameGeneration,
             gVulkanAdapterVerified.load(std::memory_order_acquire)))
@@ -4755,10 +5243,16 @@ bool WINAPI VulkanCreateGate(void* argument1, uintptr_t argument2, const void* a
     return true;
 }
 
-bool WINAPI VulkanEvaluateGate(void*, uintptr_t, const void*, void*,
-    uintptr_t, uintptr_t, entry_detour::Handle handle, const void*) noexcept
+bool WINAPI VulkanEvaluateGate(void* argument1, uintptr_t argument2, const void* argument3, void* argument4,
+    uintptr_t argument5, uintptr_t argument6, entry_detour::Handle handle, const void* caller) noexcept
 {
     const auto entry = entry_detour::ReadSnapshot(handle);
+    // RTX 30: as for Create, the runtime diverts and the provider is admitted
+    // only inside the Ampere route's tracked runtime Evaluate.
+    if (UseAmpere())
+        return entry.current && entry.kind == entry_detour::Kind::eNgxVulkanEvaluateFeature
+            && ampere_backend::VulkanProviderGate(argument1, argument2, argument3, argument4,
+                argument5, argument6, handle, caller);
     return entry.current
 #if MFG_UNLOCK_OUTPUT_PULL_MASK_ONLY
         && (entry.kind != entry_detour::Kind::eNgxVulkanEvaluateFeature
@@ -4785,11 +5279,14 @@ bool InstallNgxVulkanCreateEntry(HMODULE owner,
 #if MFG_UNLOCK_OUTPUT_PULL_MASK_ONLY
     callback = nullptr; // The gate prepares exactly once, then checks publication.
 #endif
-    void* trampoline = nullptr;
+    // A runtime entry's refusal target is its RTX 30 route thunk (it refuses as
+    // RejectUnsupportedVulkanCall does whenever RTX 30 is not selected).
     entry_detour::Handle handle{};
-    const bool installed = entry_detour::InstallForwarding(kind, owner,
-        target, callback, trampoline, options, &handle,
-        &VulkanCreateGate, reinterpret_cast<void*>(&RejectUnsupportedVulkanCall));
+    const bool runtime = kind == entry_detour::Kind::eNgxRuntimeVulkanCreateFeature
+        || kind == entry_detour::Kind::eNgxRuntimeVulkanCreateFeature1;
+    const bool installed = ampere_backend::InstallVulkanEntry(owner, generation, runtime, kind,
+        target, callback, &VulkanCreateGate, reinterpret_cast<void*>(&RejectUnsupportedVulkanCall),
+        options, &handle);
     const entry_detour::Snapshot state = entry_detour::ReadSnapshot(handle);
     Log(L"NGX Vulkan %hs entry detour: installed=%d current=%d "
         L"cachedPointersCovered=%d method=%hs failure=%u "
@@ -4866,11 +5363,11 @@ bool InstallNgxVulkanEvaluateEntry(HMODULE owner,
     entry_detour::InstallOptions options{};
     options.generation = generation;
     options.allowRelocated = true;
-    void* trampoline = nullptr;
     entry_detour::Handle handle{};
-    const bool installed = entry_detour::InstallForwarding(kind, owner,
-        target, callback, trampoline, options, &handle,
-        &VulkanEvaluateGate, reinterpret_cast<void*>(&RejectUnsupportedVulkanCall));
+    const bool installed = ampere_backend::InstallVulkanEntry(owner, generation,
+        kind == entry_detour::Kind::eNgxRuntimeVulkanEvaluateFeature, kind,
+        target, callback, &VulkanEvaluateGate, reinterpret_cast<void*>(&RejectUnsupportedVulkanCall),
+        options, &handle);
     const entry_detour::Snapshot state = entry_detour::ReadSnapshot(handle);
     Log(L"NGX Vulkan EvaluateFeature entry detour: installed=%d current=%d "
         L"cachedPointersCovered=%d method=%hs failure=%u "
@@ -4928,10 +5425,18 @@ void PrepareVulkanProviderCapabilities(entry_detour::Handle handle)
         Log(L"Vulkan DLSS-G capability maximum: published=%d generatedFrames=5 "
             L"targetRva=0x%X path=%s", published, capability.rva, path.c_str());
     }
+    else if (!capability.threshold)
+    {
+        // Without the recognized 1/5 decision the game is offered 2x on Vulkan.
+        static std::atomic<HMODULE> reported{nullptr};
+        if (reported.exchange(entry.owner, std::memory_order_relaxed) != entry.owner)
+            Log(L"Vulkan DLSS-G capability maximum not published: decision matches=%u (expected 1); "
+                L"generated frames stay at the provider's value path=%s", capability.count, path.c_str());
+    }
 }
 
 void WINAPI BeforeNgxVulkanInit(void*, uintptr_t, const void*,
-    void* physicalDevice, uintptr_t, uintptr_t, entry_detour::Handle handle,
+    void* physicalDevice, uintptr_t device, uintptr_t, entry_detour::Handle handle,
     const void*) noexcept
 {
     const bool verified = physicalDevice
@@ -4940,6 +5445,10 @@ void WINAPI BeforeNgxVulkanInit(void*, uintptr_t, const void*,
     if (verified)
     {
         if (gpu_dispatch::IsAda()) dlssg_preset::Prepare();
+        // As slSetD3DDevice does: the real-frame readout needs the interval trace.
+        temporal_interval_trace::SetEnabled(true);
+        // The base Init names its VkDevice (fifth argument).
+        if (UseAmpere()) ampere_backend::ObserveVulkanDevice(reinterpret_cast<void*>(device), false);
         gModuleInventoryDirty.store(true, std::memory_order_release);
         InspectAlreadyLoadedModules();
         ObserveOutputPullMaskVulkanInit(handle);
@@ -4958,6 +5467,7 @@ void WINAPI BeforeNgxVulkanProjectInit(void*, uintptr_t, const void*,
     if (verified)
     {
         if (gpu_dispatch::IsAda()) dlssg_preset::Prepare();
+        temporal_interval_trace::SetEnabled(true);
         gModuleInventoryDirty.store(true, std::memory_order_release);
         InspectAlreadyLoadedModules();
         ObserveOutputPullMaskVulkanInit(handle);
@@ -4968,10 +5478,8 @@ void WINAPI BeforeNgxVulkanProjectInit(void*, uintptr_t, const void*,
 bool TryInstallNgxVulkanAdapterEntryDetours(HMODULE module,
     const std::wstring& path, uint64_t generation)
 {
-    if (UseAmpere())
-    {
-        return false;
-    }
+    // RTX 30 Vulkan hosts are observed here as well: NGX Init names the
+    // VkPhysicalDevice (and, for the base Init, the VkDevice).
     if (!module || !ExportsNgxVulkanRoute(module))
         return false;
     struct AdapterEntry
@@ -5115,9 +5623,14 @@ sl::Result HandlePublicSetOptions(uint32_t routeSlot,
     const sl::DLSSGOptions& options)
 {
     ControlRouteRecord* route = ControlRouteAt(routeSlot);
-    if (!route || !EntryOriginal(
-            route->publicSetOriginal, route->publicSetHandle))
+    auto* original = route ? EntryOriginal(
+        route->publicSetOriginal, route->publicSetHandle) : nullptr;
+    if (!original)
         return sl::Result::eErrorNotInitialized;
+    // A second route's entry reached from our own forwarded call. The outer
+    // call owns gStreamlineCallMutex and the route choice; forward unchanged.
+    if (InternalControlBypassDepth() != 0)
+        return original(viewport, options);
 
     BaseStructureFields fields{};
     if (!ReadBaseStructureFields(&options, fields)
@@ -5159,6 +5672,7 @@ sl::Result HandlePublicSetOptions(uint32_t routeSlot,
     }
 
     CaptureGameOptions(viewport, options);
+    AdvancePresetSwitch(viewport, false);
     if (!gControlReady.load(std::memory_order_acquire)
         || !BridgeReady())
     {
@@ -5196,6 +5710,9 @@ sl::Result HandlePublicGetState(uint32_t routeSlot, ControlEntryPath path,
         route->publicGetOriginal, route->publicGetHandle);
     if (!original)
         return sl::Result::eErrorNotInitialized;
+    // See HandlePublicSetOptions: a nested entry from our own forwarded call.
+    if (InternalControlBypassDepth() != 0)
+        return original(viewport, state, options);
 
     const auto passThrough = [&](bool record = true) {
         if (UseAmpere())
@@ -5272,6 +5789,7 @@ sl::Result HandlePublicGetState(uint32_t routeSlot, ControlEntryPath path,
         gGetStateResolverFallbackCalls.fetch_add(
             1, std::memory_order_release);
     }
+    AdvancePresetSwitch(viewport, true);
     ReapplyPendingControl(viewport);
     ScopedInternalControlBypass bypass;
     const sl::Result result = passThrough(false);
@@ -5373,6 +5891,7 @@ sl::Result HandleInternalSetData(uint32_t routeSlot,
     }
 
     CaptureGameOptions(publicViewport, source);
+    AdvancePresetSwitch(publicViewport, false);
     // As PassPublicSetBeforeControl: the game's options pass through unchanged.
     const auto passThroughBeforeControl = [&]() {
         return passThrough();
@@ -5496,6 +6015,7 @@ sl::Result HandleInternalGetData(uint32_t routeSlot,
         return passThrough();
     std::lock_guard callLock(gStreamlineCallMutex);
     const sl::ViewportHandle publicViewport{viewportValue};
+    AdvancePresetSwitch(publicViewport, true);
     ReapplyPendingControl(publicViewport);
     const sl::Result result = passThrough(false);
     auto& mutableState = *const_cast<sl::DLSSGState*>(stateView);
@@ -5929,15 +6449,38 @@ bool InstallControlRouteLifecycleEntry(uint32_t routeSlot)
     return freeResourcesCurrent;
 }
 
+// Generation of the module instance now mapped at this base. A retired
+// module's record can share a recycled base until inventory removes it, so
+// the live path selects the current instance.
+uint64_t LiveModuleGeneration(HMODULE module)
+{
+    const std::wstring path = LoadedModulePath(module);
+    if (path.empty())
+        return 0;
+    std::lock_guard lock(gModuleMutex);
+    const auto record = std::find_if(gModuleRecords.begin(),
+        gModuleRecords.end(), [&](const ModuleRecord& candidate) {
+            return candidate.module == module
+                && _wcsicmp(candidate.path.c_str(), path.c_str()) == 0;
+        });
+    return record == gModuleRecords.end() ? 0 : record->generation;
+}
+
 uint32_t FindControlRouteForTarget(void* target) noexcept
 {
     HMODULE owner = ModuleFromAddress(target);
     if (!owner)
         return UINT32_MAX;
+    // A route kept for an unloaded wrapper must not claim the module now at
+    // its recycled base: its resolver fallback would wrap an entry the live
+    // route already detours, and that call would re-enter the control path.
+    const uint64_t generation = LiveModuleGeneration(owner);
+    if (!generation)
+        return UINT32_MAX;
     for (uint32_t slot = 0; slot < gControlRoutes.size(); ++slot)
     {
         ControlRouteRecord* route = ControlRouteAt(slot);
-        if (!route)
+        if (!route || route->generation != generation)
             continue;
         for (entry_detour::Handle handle : {route->publicSetHandle,
                  route->publicGetHandle, route->internalSetHandle,
@@ -6185,30 +6728,33 @@ sl::Result HookSlSetTagForFrame(const sl::FrameToken& frame,
     return result;
 }
 
-void InspectAlreadyLoadedModules();
+bool InspectAlreadyLoadedModules();
+
+// One call of a hook on this thread: a nested call sees a nonzero depth.
+struct ReentryScope
+{
+    uint32_t& depth;
+    explicit ReentryScope(uint32_t& value) noexcept : depth(value) { ++depth; }
+    ~ReentryScope() { --depth; }
+};
+
+// An import or resolver route and the interposer entry detour can both lead to
+// one Streamline hook for one call. The outer call (depth 0) does the work and
+// forwards along its own route; the nested entry call goes straight to the entry body.
+template <typename Fn>
+Fn* RoutedOriginal(uint32_t depth, Fn* entry, Fn* routed) noexcept
+{
+    return depth != 0 ? (entry ? entry : routed) : (routed ? routed : entry);
+}
 
 sl::Result HookSlSetD3DDevice(void* device)
 {
-    // An import or resolver route and the interposer entry detour can both
-    // lead here for one call. The outer call does the work and forwards along
-    // its own route; the nested entry call goes straight to the entry body.
     static thread_local uint32_t depth = 0;
-    auto* entry = EntryOriginal(gOriginalSlSetD3DDeviceEntry,
-        gSlSetD3DDeviceEntryHandle);
-    auto* routed = gOriginalSetD3DDevice.load(std::memory_order_acquire);
-    if (depth != 0)
-    {
-        auto* inner = entry ? entry : routed;
-        return inner ? inner(device) : sl::Result::eErrorNotInitialized;
-    }
-    auto* original = routed ? routed : entry;
-    if (!original)
-        return sl::Result::eErrorNotInitialized;
-    struct Depth
-    {
-        Depth() noexcept { ++depth; }
-        ~Depth() { --depth; }
-    } nested;
+    auto* original = RoutedOriginal(depth, EntryOriginal(gOriginalSlSetD3DDeviceEntry,
+        gSlSetD3DDeviceEntryHandle), gOriginalSetD3DDevice.load(std::memory_order_acquire));
+    if (!original || depth != 0)
+        return original ? original(device) : sl::Result::eErrorNotInitialized;
+    ReentryScope nested(depth);
     gSlSetD3DDeviceCalls.fetch_add(1, std::memory_order_relaxed);
     AllowStreamlinePluginRetention(L"slSetD3DDevice");
     InvalidateUiInputEvidence();
@@ -6232,34 +6778,188 @@ sl::Result HookSlSetD3DDevice(void* device)
     return result;
 }
 
-sl::Result HookSlSetVulkanInfo(const VulkanInfoPrefix& info)
+void PatchRecordedCandidates();
+
+bool OptiScalerPrivateStreamline(const wchar_t* path, size_t length) noexcept;
+
+// After the private instance's RTX 30 startup its sl.dlss_g is a control route
+// like the game's. OptiScaler resolves slDLSSGSetOptions/GetState through its
+// private interposer (whose entries stay untouched), so hook those public
+// wrapper entries: OptiScaler's first real call then selects the active wrapper
+// that the RTX 30 Create checks. Returns the routes with both entries current.
+uint32_t InstallOptiScalerPrivateWrapperRoutes()
 {
-    auto* original = gOriginalSetVulkanInfo.load(std::memory_order_acquire);
+    // Wrappers recorded before RTX 30 was selected are admitted on re-inspection.
+    PatchRecordedCandidates();
+    std::vector<uint32_t> slots;
+    {
+        std::lock_guard lock(gModuleMutex);
+        for (const ModuleRecord& record : gModuleRecords)
+        {
+            if (record.wrapperCandidate && record.wrapperPatched
+                && record.controlRouteSlot != UINT32_MAX
+                && OptiScalerPrivateStreamline(record.path.c_str(), record.path.size()))
+                slots.push_back(record.controlRouteSlot);
+        }
+    }
+    uint32_t installed = 0;
+    for (const uint32_t slot : slots)
+    {
+        InstallControlRouteEntries(slot);
+        const ControlRouteRecord* route = ControlRouteAt(slot);
+        if (route && ControlEntryCurrent(route->publicSetHandle)
+            && ControlEntryCurrent(route->publicGetHandle))
+            ++installed;
+    }
+    return installed;
+}
+
+// OptiScaler's DLSS-G output runs its private Streamline, whose slSetD3DDevice
+// (called from OptiScaler's D3D12CreateDevice hook) starts the plug-ins before
+// the game's interposer sees a device. sl.dlss_g's slOnPluginStartup caches
+// min(DLSSG.MultiFrameCountMax, compiled maximum) there, so on Ada the wrapper
+// clamp and the provider gate must already be patched. On RTX 30 with no game
+// Streamline, this call is the startup boundary itself (early init, capability
+// bootstrap, admission), then the private wrapper becomes a control route.
+// It binds no host, opens no plug-in retention and forwards only into the
+// private instance.
+sl::Result HookOptiScalerSlSetD3DDevice(void* device)
+{
+    auto* original = EntryOriginal(gOriginalOptiScalerSlSetD3DDevice,
+        gOptiScalerSlSetD3DDeviceEntryHandle);
     if (!original)
         return sl::Result::eErrorNotInitialized;
-    AllowStreamlinePluginRetention(L"slSetVulkanInfo");
-    InvalidateUiInputEvidence();
-    void* physicalDevice = nullptr;
+    const uint64_t call = gOptiScalerSlSetD3DDeviceCalls.fetch_add(1,
+        std::memory_order_relaxed) + 1;
+    // RTX 30 declares its architecture at startup and keeps its own route.
+    const bool ampere = ampere_provider_arch::Armed() || UseAmpere();
+    const bool ada = !ampere && gpu_dispatch::ObserveAdaD3D12Device(device);
+    bool inventoried = false;
+    if (ada)
+    {
+        // Its slInit loaded the plug-ins on this thread just before; discovery
+        // may not have recorded them yet. Toolhelp can fail while another
+        // thread loads a module, so retry briefly, then use the records held.
+        for (int attempt = 0; attempt < 8 && !inventoried; ++attempt)
+        {
+            if (attempt) Sleep(2);
+            inventoried = InspectAlreadyLoadedModules();
+        }
+        PatchRecordedCandidates();
+    }
+    Log(L"OptiScaler private Streamline slSetD3DDevice: call=%llu ada=%d ampere=%d inventory=%d "
+        L"(before its plug-in startup)", static_cast<unsigned long long>(call), ada, ampere, inventoried);
+    if (!ampere)
+        return original(device);
+
+    optiscaler_private_streamline::Inputs inputs{};
+    inputs.admittedBefore = gOptiScalerPrivateAmpereAdmitted.load(std::memory_order_acquire);
+    inputs.gameStreamline = ampere_backend::EarlyInitObserved()
+        || gHostInterposer.load(std::memory_order_acquire) != nullptr;
+    inputs.hookedAtLoad = gOptiScalerSlSetD3DDeviceAtLoad.load(std::memory_order_acquire);
+    inputs.armedAtLoad = gOptiScalerSlSetD3DDeviceArmedAtLoad.load(std::memory_order_acquire);
+    if (optiscaler_private_streamline::NeedsDevice(inputs))
+    {
+        // As at the game's slSetD3DDevice: this device selects and verifies the adapter.
+        inputs.ampereDevice = gpu_backend::ObserveD3D12Device(device) && UseAmpere();
+        if (inputs.ampereDevice)
+        {
+            gModuleInventoryDirty.store(true, std::memory_order_release);
+            temporal_interval_trace::SetEnabled(true);
+        }
+    }
+    const auto decision = optiscaler_private_streamline::Decide(inputs);
+    Log(L"OptiScaler private Streamline RTX 30 startup: call=%llu decision=%hs gameStreamline=%d "
+        L"hookedAtLoad=%d armedAtLoad=%d device=%d",
+        static_cast<unsigned long long>(call), optiscaler_private_streamline::DecisionName(decision),
+        inputs.gameStreamline, inputs.hookedAtLoad, inputs.armedAtLoad, inputs.ampereDevice);
+    if (!optiscaler_private_streamline::RunsStartup(decision, inputs.ampereDevice))
+        return original(device);
+    if (decision == optiscaler_private_streamline::Decision::eAdmit)
+    {
+        // Hooked as its interposer mapped, with the declaration armed: the
+        // early boundary the game's slInit hook would otherwise establish.
+        gOptiScalerPrivateAmpereAdmitted.store(true, std::memory_order_release);
+        ampere_backend::ObserveEarlyInit();
+    }
+    const sl::Result result = InvokeAmpereDeviceSetup(original, device);
+    const bool ready = ampere_backend::Ready();
+    const uint32_t routes = ready ? InstallOptiScalerPrivateWrapperRoutes() : 0;
+    Log(L"OptiScaler private Streamline RTX 30 startup result: call=%llu result=%u ready=%d "
+        L"failure=%u startupMaximum=%u wrapperRoutes=%u",
+        static_cast<unsigned long long>(call), static_cast<unsigned>(result), ready,
+        ampere_backend::FailureCode(), ampere_backend::StartupMaximumGeneratedFrames(), routes);
+    return result;
+}
+
+// sl::VulkanInfo v1-v3 carry the same device and physical-device prefix.
+void ReadVulkanInfo(const VulkanInfoPrefix& info, void*& physicalDevice, void*& device) noexcept
+{
+    physicalDevice = nullptr;
+    device = nullptr;
     __try
     {
         if (info.structVersion >= sl::kStructVersion1
             && info.structVersion <= sl::kStructVersion3)
+        {
             physicalDevice = info.physicalDevice;
+            device = info.device;
+        }
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
         physicalDevice = nullptr;
+        device = nullptr;
     }
+}
+
+sl::Result HookSlSetVulkanInfo(const VulkanInfoPrefix& info)
+{
+    static thread_local uint32_t depth = 0;
+    auto* original = RoutedOriginal(depth, EntryOriginal(gOriginalSlSetVulkanInfoEntry,
+        gSlSetVulkanInfoEntryHandle), gOriginalSetVulkanInfo.load(std::memory_order_acquire));
+    if (!original || depth != 0)
+        return original ? original(info) : sl::Result::eErrorNotInitialized;
+    ReentryScope nested(depth);
+    AllowStreamlinePluginRetention(L"slSetVulkanInfo");
+    InvalidateUiInputEvidence();
+    void* physicalDevice = nullptr;
+    void* device = nullptr;
+    ReadVulkanInfo(info, physicalDevice, device);
     const bool verified = physicalDevice
         && gpu_backend::ObserveVulkanPhysicalDevice(physicalDevice);
     gVulkanAdapterVerified.store(verified, std::memory_order_release);
     if (verified)
     {
         if (gpu_dispatch::IsAda()) dlssg_preset::Prepare();
+        temporal_interval_trace::SetEnabled(true);
+        if (UseAmpere()) ampere_backend::ObserveVulkanDevice(device, true);
         gModuleInventoryDirty.store(true, std::memory_order_release);
         InspectAlreadyLoadedModules();
     }
-    return original(info);
+    return UseAmpere() && verified ? InvokeAmpereVulkanSetup(original, info) : original(info);
+}
+
+// The interposer's vkCreateDevice, on RTX 30 systems only: it creates the
+// host's device and then starts the Streamline plug-ins on it.
+int32_t WINAPI HookSlVulkanCreateDevice(void* physicalDevice, const void* createInfo,
+    const void* allocator, void** device)
+{
+    auto* original = EntryOriginal(gOriginalSlVulkanCreateDevice, gSlVulkanCreateDeviceEntryHandle);
+    if (!original)
+        return kVkErrorInitializationFailed;
+    if (!ampere_provider_arch::Armed())
+        return original(physicalDevice, createInfo, allocator, device);
+    const bool verified = physicalDevice
+        && gpu_backend::ObserveVulkanPhysicalDevice(physicalDevice);
+    gVulkanAdapterVerified.store(verified, std::memory_order_release);
+    if (!verified || !UseAmpere())
+        return original(physicalDevice, createInfo, allocator, device);
+    AllowStreamlinePluginRetention(L"vkCreateDevice");
+    InvalidateUiInputEvidence();
+    temporal_interval_trace::SetEnabled(true);
+    gModuleInventoryDirty.store(true, std::memory_order_release);
+    return InvokeAmpereVulkanDeviceCreation(original, physicalDevice, createInfo, allocator, device);
 }
 
 bool HookModuleImport(HMODULE module, const char* importedModule,
@@ -6653,9 +7353,31 @@ bool InstallStreamlineLoaderDiscovery(
     return installed;
 }
 
+// slinitloop.1: the slInit entry detour's own trampoline (the real slInit) while that detour is installed, also when
+// it no longer verifies. Subnautica 2 loaded MFG Unlocker more than 2 GB from sl.interposer, so the entry jumps
+// through a near relay, and OptiScaler's Detours hook followed our jumps and re-hooked that relay. target: the export
+// the trampoline must belong to (null: any).
+PFun_slInit* SlInitEntryTrampoline(const void* target) noexcept
+{
+    const auto state = entry_detour::ReadSnapshot(gSlInitEntryHandle);
+    if (!state.installed || !state.original || (target && state.target != target))
+        return nullptr;
+    return reinterpret_cast<PFun_slInit*>(state.original);
+}
+
 sl::Result HookSlInit(const sl::Preferences& preferences,
     uint64_t sdkVersion)
 {
+    // slinitloop.1: never run twice on one thread. A chain that leads back into this hook (another hook library on
+    // our entry while ours calls the export) forwards once to the real slInit instead of recursing until the stack
+    // overflows.
+    thread_local uint32_t inside = 0;
+    if (inside)
+    {
+        auto* real = SlInitEntryTrampoline(nullptr);
+        return real ? real(preferences, sdkVersion) : sl::Result::eErrorNotInitialized;
+    }
+    ReentryScope insideScope(inside);
     fault_capture::BeforeSlInit();
     auto* original = EntryOriginal(gOriginalSlInit, gSlInitEntryHandle);
     if (!original || original == &HookSlInit)
@@ -6709,6 +7431,9 @@ sl::Result HookSlInit(const sl::Preferences& preferences,
         // slSetD3DDevice only through its entry. It identifies the GPU and
         // patches the DLSS-G wrapper before the plugins read their limits.
         TryInstallSlSetD3DDeviceEntryDetour(interposer);
+        // RTX 30 Vulkan hosts: slSetVulkanInfo and the interposer's
+        // vkCreateDevice start the plug-ins (detected RTX 30 systems only).
+        TryInstallSlVulkanEntryDetours(interposer);
     }
     if (interposer
         && !gStreamlineLoaderDiscoveryInstalled.load(
@@ -6748,15 +7473,16 @@ sl::Result HookSlInit(const sl::Preferences& preferences,
     static_assert(static_cast<uint32_t>(OtaGpu::eUnknown) == static_cast<uint32_t>(gpu_dispatch::Family::eUnknown)
         && static_cast<uint32_t>(OtaGpu::eAda) == static_cast<uint32_t>(gpu_dispatch::Family::eAda)
         && static_cast<uint32_t>(OtaGpu::eAmpere) == static_cast<uint32_t>(gpu_dispatch::Family::eAmpere)
+        && static_cast<uint32_t>(OtaGpu::eTuring) == static_cast<uint32_t>(gpu_dispatch::Family::eTuring)
         && static_cast<uint32_t>(OtaGpu::eConflict) == static_cast<uint32_t>(gpu_dispatch::Family::eConflict));
     const auto earlyHardware = ampere_provider_arch::Read();
     const OtaGpu inventoryGpu = streamline_ota_policy::InventoryGpu(earlyHardware.detected,
         earlyHardware.physicalGpuCount, earlyHardware.singleGpuArchitecture,
-        ampere_provider_arch::IsAmpereRtx(earlyHardware.singleGpuArchitecture, earlyHardware.singleGpuImplementation));
+        ampere_provider_arch::IsTranslatedRtx(earlyHardware.singleGpuArchitecture, earlyHardware.singleGpuImplementation));
     // V1.5: only RTX 30 uses the early inventory. Ada keeps beta.7's rule
     // (full OTA once gpu_dispatch has selected Ada), so an RTX 40 title's
     // plugin set does not change with this port.
-    const OtaGpu earlyGpu = inventoryGpu == OtaGpu::eAmpere ? inventoryGpu : OtaGpu::eUnknown;
+    const OtaGpu earlyGpu = (inventoryGpu == OtaGpu::eAmpere || inventoryGpu == OtaGpu::eTuring) ? inventoryGpu : OtaGpu::eUnknown;
     const auto selectedGpu = static_cast<OtaGpu>(gpu_dispatch::Selected());
     static const bool nativeStreamlinePinned = [] {
         wchar_t value[2]{};
@@ -6975,6 +7701,144 @@ bool TryInstallSlSetD3DDeviceEntryDetour(HMODULE interposer)
     return installed;
 }
 
+// RTX 30 systems: the interposer's slSetVulkanInfo (hosts that resolve its
+// exports themselves) and its vkCreateDevice (interposer-loaded Vulkan hosts,
+// which never call slSetVulkanInfo) are the Vulkan startup brackets.
+bool TryInstallSlVulkanEntryDetours(HMODULE interposer)
+{
+    if (!interposer || !ampere_provider_arch::Armed())
+        return false;
+    const std::wstring path = LoadedModulePath(interposer);
+    if (!ModuleFileNameEquals(path, L"sl.interposer.dll")
+        || !HostInterposer(interposer, path))
+        return false;
+    struct Entry
+    {
+        const char* name;
+        entry_detour::Kind kind;
+        void* hook;
+        entry_detour::Handle* handle;
+    };
+    const Entry entries[] = {
+        {"slSetVulkanInfo", entry_detour::Kind::eSlSetVulkanInfo,
+            reinterpret_cast<void*>(&HookSlSetVulkanInfo), &gSlSetVulkanInfoEntryHandle},
+        {"vkCreateDevice", entry_detour::Kind::eSlVulkanCreateDevice,
+            reinterpret_cast<void*>(&HookSlVulkanCreateDevice), &gSlVulkanCreateDeviceEntryHandle},
+    };
+    bool installedAll = true;
+    for (const Entry& entry : entries)
+    {
+        void* target = reinterpret_cast<void*>(GetProcAddress(interposer, entry.name));
+        if (!target || ModuleFromAddress(target) != interposer)
+        {
+            installedAll = false;
+            continue;
+        }
+        // No version-dependent entry pattern is known; use the relocation path.
+        entry_detour::InstallOptions options{};
+        options.allowRelocated = true;
+        void* trampoline = nullptr;
+        const bool installed = entry_detour::Install(entry.kind, interposer, target,
+            entry.hook, trampoline, options, entry.handle);
+        if (trampoline && entry.kind == entry_detour::Kind::eSlSetVulkanInfo)
+            gOriginalSlSetVulkanInfoEntry.store(
+                reinterpret_cast<PFun_slSetVulkanInfoAbi*>(trampoline), std::memory_order_release);
+        if (trampoline && entry.kind == entry_detour::Kind::eSlVulkanCreateDevice)
+            gOriginalSlVulkanCreateDevice.store(
+                reinterpret_cast<PFun_vkCreateDeviceAbi*>(trampoline), std::memory_order_release);
+        installedAll = installedAll && installed;
+        static std::atomic<uint32_t> logged[2]{};
+        const uint32_t outcome = installed ? 1u : 2u;
+        auto& slot = logged[entry.kind == entry_detour::Kind::eSlSetVulkanInfo ? 0 : 1];
+        if (slot.exchange(outcome, std::memory_order_acq_rel) != outcome)
+        {
+            const entry_detour::Snapshot state = entry_detour::ReadSnapshot(*entry.handle);
+            Log(L"Streamline %hs entry detour (RTX 30 Vulkan startup): installed=%d "
+                L"current=%d method=%hs failure=%u targetRva=0x%X path=%s",
+                entry.name, installed, state.current, entry_detour::MethodName(state.method),
+                static_cast<uint32_t>(state.failure), state.targetRva, path.c_str());
+        }
+    }
+    return installedAll;
+}
+
+// Loader notification for OptiScaler's private sl.interposer.dll, with the
+// loader lock held. OptiScaler loads it and calls slInit and slSetD3DDevice
+// straight away, before discovery would see it. Hotpatch only (the 2.14 entry
+// profile), never waits for the detour registry and never logs.
+void InstallOptiScalerSlSetD3DDeviceAtLoad(HMODULE interposer,
+    const UNICODE_STRING* path) noexcept
+{
+    if (!interposer || !path || !path->Buffer
+        || !OptiScalerPrivateStreamline(path->Buffer, path->Length / sizeof(wchar_t)))
+        return;
+    void* target = MappedExportAddress(interposer, "slSetD3DDevice");
+    if (!target)
+        return;
+    entry_detour::InstallOptions options{};
+    options.nonBlocking = true;
+    void* trampoline = nullptr;
+    entry_detour::Handle handle{};
+    bool installed = false;
+    for (int attempt = 0; attempt < 50; ++attempt)
+    {
+        installed = entry_detour::Install(entry_detour::Kind::eOptiScalerSlSetD3DDevice,
+            interposer, target, reinterpret_cast<void*>(&HookOptiScalerSlSetD3DDevice),
+            trampoline, options, &handle);
+        if (installed || handle)
+            break;
+        Sleep(1);
+    }
+    if (trampoline)
+        gOriginalOptiScalerSlSetD3DDevice.store(
+            reinterpret_cast<PFun_slSetD3DDevice*>(trampoline), std::memory_order_release);
+    if (installed)
+    {
+        gOptiScalerSlSetD3DDeviceEntryHandle = handle;
+        gOptiScalerSlSetD3DDeviceArmedAtLoad.store(ampere_provider_arch::Armed(),
+            std::memory_order_release);
+        gOptiScalerSlSetD3DDeviceAtLoad.store(true, std::memory_order_release);
+    }
+}
+
+// Discovery path for OptiScaler's private interposer: keeps the load-time
+// hotpatch, or installs the entry (relocation allowed) when that profile did
+// not match. Its slInit and other entries stay untouched.
+bool TryInstallOptiScalerSlSetD3DDeviceEntryDetour(HMODULE interposer,
+    const std::wstring& path)
+{
+    if (!interposer || !OptiScalerPrivateStreamline(path.c_str(), path.size()))
+        return false;
+    void* target = reinterpret_cast<void*>(
+        GetProcAddress(interposer, "slSetD3DDevice"));
+    if (!target || ModuleFromAddress(target) != interposer)
+        return false;
+    entry_detour::InstallOptions options{};
+    options.allowRelocated = true;
+    void* trampoline = nullptr;
+    const bool installed = entry_detour::Install(
+        entry_detour::Kind::eOptiScalerSlSetD3DDevice, interposer, target,
+        reinterpret_cast<void*>(&HookOptiScalerSlSetD3DDevice), trampoline,
+        options, &gOptiScalerSlSetD3DDeviceEntryHandle);
+    if (trampoline)
+        gOriginalOptiScalerSlSetD3DDevice.store(
+            reinterpret_cast<PFun_slSetD3DDevice*>(trampoline), std::memory_order_release);
+    static std::atomic<uint32_t> logged{0};
+    const uint32_t outcome = installed ? 1u : 2u;
+    if (logged.exchange(outcome, std::memory_order_acq_rel) != outcome)
+    {
+        const entry_detour::Snapshot state =
+            entry_detour::ReadSnapshot(gOptiScalerSlSetD3DDeviceEntryHandle);
+        Log(L"OptiScaler private Streamline slSetD3DDevice entry detour: installed=%d "
+            L"current=%d atLoad=%d method=%hs failure=%u targetRva=0x%X path=%s",
+            installed, state.current,
+            gOptiScalerSlSetD3DDeviceAtLoad.load(std::memory_order_acquire),
+            entry_detour::MethodName(state.method), static_cast<uint32_t>(state.failure),
+            state.targetRva, path.c_str());
+    }
+    return installed;
+}
+
 bool TryInstallSlInitEntryDetour(HMODULE interposer, void* resolvedTarget)
 {
     if (!interposer)
@@ -6984,9 +7848,15 @@ bool TryInstallSlInitEntryDetour(HMODULE interposer, void* resolvedTarget)
         return false;
     if (!HostInterposer(interposer, path))
     {
+        // OptiScaler's private instance: only its own slSetD3DDevice entry, so
+        // Ada's wrapper maximum is patched before its plug-ins start.
+        const bool optiScaler = TryInstallOptiScalerSlSetD3DDeviceEntryDetour(interposer, path);
         static std::atomic<HMODULE> logged{nullptr};
         if (logged.exchange(interposer, std::memory_order_acq_rel) != interposer)
-            Log(L"Streamline interposer left untouched (not the game's instance): path=%s",
+            Log(optiScaler
+                    ? L"Streamline interposer is OptiScaler's private instance; only its slSetD3DDevice "
+                      L"is hooked (not the game's instance): path=%s"
+                    : L"Streamline interposer left untouched (not the game's instance): path=%s",
                 path.c_str());
         return false;
     }
@@ -7126,6 +7996,14 @@ FARPROC WINAPI HookMainGetProcAddress(HMODULE module, LPCSTR functionName)
     {
         return resolved;
     }
+    // slinitloop.1: an entry detour that is installed but no longer verifies still routes the export into HookSlInit.
+    // Keep its trampoline as the original and hand out the export. Storing the export as the original and returning
+    // HookSlInit made our hook and OptiScaler's call each other until the stack overflowed.
+    if (auto* trampoline = SlInitEntryTrampoline(reinterpret_cast<void*>(resolved)))
+    {
+        gOriginalSlInit.store(trampoline, std::memory_order_release);
+        return resolved;
+    }
 
     auto* candidate = reinterpret_cast<PFun_slInit*>(resolved);
     if (candidate != &HookSlInit)
@@ -7200,7 +8078,8 @@ bool InstallSlInitControlPath()
     HMODULE interposer = GetModuleHandleW(L"sl.interposer.dll");
     const bool entryInstalled = interposer
         && TryInstallSlInitEntryDetour(interposer, nullptr);
-    const bool iatFallback = entryInstalled
+    // slinitloop.1: no IAT fallback while an installed entry detour still routes the export here.
+    const bool iatFallback = entryInstalled || SlInitEntryTrampoline(nullptr)
         ? false : InstallSlInitIatFallback();
     return entryInstalled || iatFallback || resolverDiscovery;
 }
@@ -7266,6 +8145,7 @@ FARPROC WINAPI HookSlCommonGetProcAddress(
     {
         TryInstallNgxCreateEntryDetour(module, path, record.generation);
         TryInstallNgxEvaluateEntryDetour(module, path, record.generation);
+        ampere_backend::InstallVulkanRoute(module, path.c_str(), record.generation, false);
         TryInstallNgxVulkanCreateEntryDetours(
             module, path, record.generation);
         TryInstallNgxVulkanEvaluateEntryDetour(
@@ -7279,6 +8159,8 @@ FARPROC WINAPI HookSlCommonGetProcAddress(
             module, path, record.generation);
         TryInstallNgxRuntimeEvaluateEntryDetour(
             module, path, record.generation);
+        if (IsNgxRuntimeModule(module))
+            ampere_backend::InstallVulkanRoute(module, path.c_str(), record.generation, true);
         TryInstallNgxRuntimeVulkanCreateEntryDetours(
             module, path, record.generation);
         TryInstallNgxRuntimeVulkanEvaluateEntryDetour(
@@ -7502,21 +8384,76 @@ bool AmpereFilteredWrapper(HMODULE module) noexcept
     return false;
 }
 
+// [Compatibility] Rtx30FlipMetering in RTX40MFG-UI.ini beside the game
+// executable (on by default in test builds), read once on the first wrapper's
+// loader return (before its startup probe); the choice holds for the process.
+void ConfigureAmpereFlipMetering()
+{
+    if (ampere_flip_metering::Configured()) return;
+    const std::wstring path = standalone_ui::SettingsPath("RTX40MFG-UI.ini");
+    const auto setting = ampere_flip_metering::ReadSetting(path.c_str());
+    const bool enabled = ampere_flip_metering::Enabled(setting);
+    ampere_flip_metering::Configure(enabled);
+    const wchar_t* source = setting == ampere_flip_metering::Setting::eOn ? L"set to 1"
+        : setting == ampere_flip_metering::Setting::eOff ? L"set to 0"
+        : setting == ampere_flip_metering::Setting::eInvalid ? L"not 1 or 0, default used" : L"not set, default used";
+    Log(L"Ampere flip metering path: %s ([%s] %s %s in %s); %s",
+        enabled ? L"on" : L"off", ampere_flip_metering::kSection, ampere_flip_metering::kKey, source, path.c_str(),
+        enabled ? L"the DLSS-G wrapper may use flip-metering presentation"
+                : L"the DLSS-G wrapper stays on CPU-paced presentation");
+}
+
+bool AmpereFlipMeteringForwarded() noexcept
+{
+    return ampere_flip_metering::OptIn() && !gFlipForwardBlocked.load(std::memory_order_acquire);
+}
+
 void RegisterAmpereFilteredWrapper(HMODULE module, const std::wstring& path)
 {
     if (AmpereFilteredWrapper(module)) return;
+    ConfigureAmpereFlipMetering();
+    const bool v2Generation = ampere_flip_metering::ImageQueriesCaps(module);
+    if (ampere_flip_metering::OptIn() && !v2Generation)
+    {
+        gFlipForwardBlocked.store(true, std::memory_order_release);
+        Log(L"Ampere flip metering path not applied: the wrapper has no V2 capability query "
+            L"(pre-2.11 generation; withheld as in beta.4): %s", path.c_str());
+    }
     for (auto& wrapper : gAmpereFilteredWrappers)
     {
         HMODULE expected = nullptr;
         if (wrapper.compare_exchange_strong(expected, module, std::memory_order_acq_rel))
         {
             gWrapperNvapiFilterInstalled.store(true, std::memory_order_release);
-            Log(L"Ampere DLSS-G wrapper NVAPI view: flip metering withheld (SetFlipConfig, caps) "
-                L"through resolver discovery: %s", path.c_str());
+            Log(AmpereFlipMeteringForwarded()
+                    ? L"Ampere DLSS-G wrapper NVAPI view: flip metering forwarded (SetFlipConfig observed) "
+                      L"through resolver discovery: %s"
+                    : L"Ampere DLSS-G wrapper NVAPI view: flip metering withheld (SetFlipConfig, caps) "
+                      L"through resolver discovery: %s", path.c_str());
             return;
         }
     }
     Log(L"Ampere DLSS-G wrapper NVAPI view unavailable: wrapper slots full: %s", path.c_str());
+}
+
+// Flip-metering path: forwards the wrapper's SetFlipConfig and records whether it asked for
+// metered batches (ampere_flip_metering.h). Runs on the wrapper's present path.
+int __cdecl ObservedSetFlipConfig(void* device, void* reserved, void* params, void* extra)
+{
+    const auto real = gWrapperSetFlipConfig.load(std::memory_order_acquire);
+    if (!real) return -1; // NVAPI_ERROR
+    uint32_t version = 0, framesPerBatch = 0;
+    const bool read = ampere_flip_metering::ReadParams(params, version, framesPerBatch);
+    const int status = real(device, reserved, params, extra);
+    if (ampere_flip_metering::Observe(read ? version : 0, framesPerBatch, status))
+    {
+        static std::atomic<uint32_t> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 16)
+            Log(L"Ampere flip metering %s: SetFlipConfig version=0x%X nFramesPerBatch=%u status=%d",
+                ampere_flip_metering::Active() ? L"active (repeated outputs admitted)" : L"inactive",
+                version, framesPerBatch, status);
+    }
+    return status;
 }
 
 void* __cdecl FilteredWrapperNvapiQuery(uint32_t id)
@@ -7526,8 +8463,22 @@ void* __cdecl FilteredWrapperNvapiQuery(uint32_t id)
         return nullptr;
     if (ampere_flip_metering::Hidden(id) && AmpereWrapperAuditApplies())
     {
-        gFlipMeteringHidden.fetch_add(1, std::memory_order_relaxed);
-        return nullptr;
+        if (!AmpereFlipMeteringForwarded())
+        {
+            gFlipMeteringHidden.fetch_add(1, std::memory_order_relaxed);
+            return nullptr;
+        }
+        void* resolved = query(id);
+        gFlipMeteringForwarded.fetch_add(1, std::memory_order_relaxed);
+        if (id != ampere_flip_metering::kSetFlipConfig || !resolved)
+            return resolved; // The V2 capability query is forwarded unchanged.
+        auto* real = reinterpret_cast<NvapiSetFlipConfigFn>(resolved);
+        NvapiSetFlipConfigFn expected = nullptr;
+        if (!gWrapperSetFlipConfig.compare_exchange_strong(expected, real,
+                std::memory_order_acq_rel, std::memory_order_acquire) && expected != real)
+            return resolved; // Unobserved: repeated outputs stay refused (and latch at 2x).
+        ampere_flip_metering::MarkObserving();
+        return reinterpret_cast<void*>(&ObservedSetFlipConfig);
     }
     return query(id);
 }
@@ -7763,6 +8714,10 @@ bool AmperePreparationStillCurrent(HMODULE provider, const ampere_gpu::Preparati
 void PrepareNgxInitialization(void* device, const entry_detour::Snapshot& entry,
     const void*, bool firstInit) noexcept
 {
+    // Before NVIDIA's Init: the DLSS SR provider reads its DRS preset key once,
+    // when NGX initializes it.
+    if (entry.current && device && gpu_dispatch::Selected() != gpu_dispatch::Family::eConflict)
+        dlss_sr::PrepareForDevice(static_cast<ID3D12Device*>(device));
     if (gpu_dispatch::IsAda() || gpu_dispatch::Selected() == gpu_dispatch::Family::eConflict) return;
     const auto ticket = ngx_initialization::PreparationTicket();
     if (!firstInit || !ticket || !entry.current || !device
@@ -8140,8 +9095,13 @@ ModuleRecord InspectLoadedModule(HMODULE module, const std::wstring& suppliedPat
             if (record.ngxExport && ampere_provider_arch::Armed())
             {
                 const auto declared = ampere_provider_arch::Declare(module);
-                Log(L"Ampere DLSS-G architecture declaration: outcome=%hs path=%s",
-                    ampere_provider_arch::OutcomeName(declared), path.c_str());
+                // The Vulkan record follows a successful D3D12 declaration only.
+                const bool vulkanChecked = declared == ampere_provider_arch::Outcome::eDeclared
+                    || declared == ampere_provider_arch::Outcome::eAlreadyDeclared;
+                Log(L"Ampere DLSS-G architecture declaration: outcome=%hs vulkanRequirements=%hs path=%s",
+                    ampere_provider_arch::OutcomeName(declared), ampere_provider_arch::VulkanOutcomeName(
+                        vulkanChecked ? ampere_provider_arch::Read().lastVulkan
+                            : ampere_provider_arch::VulkanOutcome::eNotChecked), path.c_str());
             }
             if (record.ngxExport)
             {
@@ -8202,6 +9162,9 @@ ModuleRecord InspectLoadedModule(HMODULE module, const std::wstring& suppliedPat
             snapshot.module, snapshot.path, snapshot.generation);
         TryInstallNgxEvaluateEntryDetour(
             snapshot.module, snapshot.path, snapshot.generation);
+        // RTX 30 systems: the provider's Vulkan Release before its Create entries.
+        ampere_backend::InstallVulkanRoute(
+            snapshot.module, snapshot.path.c_str(), snapshot.generation, false);
         TryInstallNgxVulkanCreateEntryDetours(
             snapshot.module, snapshot.path, snapshot.generation);
         TryInstallNgxVulkanEvaluateEntryDetour(
@@ -8249,6 +9212,11 @@ ModuleRecord InspectLoadedModule(HMODULE module, const std::wstring& suppliedPat
             snapshot.module, snapshot.path, snapshot.generation);
         TryInstallNgxRuntimeEvaluateEntryDetour(
             snapshot.module, snapshot.path, snapshot.generation);
+        // RTX 30 systems: the runtime's Vulkan Release, requirements and
+        // capability parameters, before its Vulkan Create entries.
+        if (IsNgxRuntimeModule(snapshot.module))
+            ampere_backend::InstallVulkanRoute(
+                snapshot.module, snapshot.path.c_str(), snapshot.generation, true);
         TryInstallNgxRuntimeVulkanCreateEntryDetours(
             snapshot.module, snapshot.path, snapshot.generation);
         TryInstallNgxRuntimeVulkanEvaluateEntryDetour(
@@ -8328,7 +9296,7 @@ void RemoveLoadedModule(const ModuleRecord& expected)
     }
 }
 
-void InspectAlreadyLoadedModules()
+bool InspectAlreadyLoadedModules()
 {
     // Only consider observations which predate the snapshot for retirement.
     std::vector<ModuleRecord> previousRecords;
@@ -8341,7 +9309,7 @@ void InspectAlreadyLoadedModules()
     if (snapshot == INVALID_HANDLE_VALUE)
     {
         Log(L"Could not enumerate loaded modules (%lu)", GetLastError());
-        return;
+        return false;
     }
 
     std::vector<HMODULE> loadedModules;
@@ -8365,6 +9333,32 @@ void InspectAlreadyLoadedModules()
         if (std::find(loadedModules.begin(), loadedModules.end(),
                 record.module) == loadedModules.end())
             RemoveLoadedModule(record);
+    }
+    return true;
+}
+
+// Patches the wrapper clamps and provider gates recorded before Ada was
+// selected, from the records already held (no Toolhelp inventory, which can
+// fail while another thread loads a module). A module observed from now on is
+// patched as soon as it is recorded.
+void PatchRecordedCandidates()
+{
+    std::vector<ModuleRecord> pending;
+    {
+        std::lock_guard lock(gModuleMutex);
+        for (const ModuleRecord& record : gModuleRecords)
+        {
+            if ((record.wrapperCandidate && !record.wrapperPatched)
+                || (record.ngxExport && !record.ngxPatched))
+                pending.push_back(record);
+        }
+    }
+    for (const ModuleRecord& record : pending)
+    {
+        ScopedModuleReference retained(record.module);
+        if (retained && _wcsicmp(LoadedModulePath(record.module).c_str(),
+                record.path.c_str()) == 0)
+            InspectLoadedModule(record.module, record.path);
     }
 }
 
@@ -8485,8 +9479,12 @@ void CALLBACK OnDllNotification(
     static constexpr ULONG kDllUnloaded = 2;
     if (data && reason == kDllLoaded && data->loaded.dllBase
         && UnicodeNameEquals(data->loaded.baseDllName, L"sl.interposer.dll"))
+    {
         InstallSlInitEntryAtLoad(static_cast<HMODULE>(data->loaded.dllBase),
             data->loaded.fullDllName);
+        InstallOptiScalerSlSetD3DDeviceAtLoad(static_cast<HMODULE>(data->loaded.dllBase),
+            data->loaded.fullDllName);
+    }
     // NGX validates a DLSS-G snippet against the GPU right after mapping it.
     // Declare RTX 30 support before LoadLibrary returns (no waits or logging).
     if (data && reason == kDllLoaded && data->loaded.dllBase && ampere_provider_arch::Armed())
@@ -8532,10 +9530,8 @@ DWORD WINAPI PatchWorker(void* context)
 {
     EnsureAmpereFeatureLifetimeObserver();
     const DWORD pid = GetCurrentProcessId();
-    wchar_t tempDirectory[MAX_PATH]{};
-    const DWORD tempLength = GetTempPathW(_countof(tempDirectory), tempDirectory);
-    if (!tempLength || tempLength >= _countof(tempDirectory))
-        tempDirectory[0] = L'\0';
+    // The game folder, or %TEMP% when it cannot be written.
+    const std::wstring& logDirectory = diagnostic_paths::LogDirectory();
     const std::wstring logPath=diagnostic_paths::RuntimeLog();
     if (!logPath.empty())
     {
@@ -8548,6 +9544,9 @@ DWORD WINAPI PatchWorker(void* context)
     gLogReady.store(gLog != nullptr, std::memory_order_release);
     single_module::DrainLog(&MidpointLog);
     fault_capture::Initialize(&MidpointLog);
+    // Opt-in; before the game reads its adapter name for its settings.
+    gpu_name_override::ArmFromSettings();
+    single_module::DrainLog(&MidpointLog);
 
     const std::wstring mappingName = MfgUnlockObjectName(L"Status", pid);
     HANDLE mapping = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, mappingName.c_str());
@@ -8565,7 +9564,6 @@ DWORD WINAPI PatchWorker(void* context)
     const std::wstring executableDirectory = ParentPath(executablePath);
     if (gExecutablePath.empty())
         gExecutablePath = executablePath;
-    ResolveNvidiaCompatibilityPolicy();
     if (gConfigPath.empty())
     {
         gConfigPath = ResolveConfigPath(
@@ -8574,7 +9572,7 @@ DWORD WINAPI PatchWorker(void* context)
     gStatusPath = ResolveStatusPath(gConfigPath, executableDirectory);
     // The first atomic publication replaces the previous launch's snapshot.
     // Never delete a file another live process may still own.
-    temporal_interval_trace::Initialize(tempDirectory, executablePath.c_str());
+    temporal_interval_trace::Initialize(logDirectory.c_str(), executablePath.c_str());
     ControlConfig savedControl = ReadInitialControl();
     optiscaler_host::SetUiOptIn(savedControl.optiScalerUi == 1);
     bool uiDelegated = optiscaler_host::UiDelegated();
@@ -8587,6 +9585,27 @@ DWORD WINAPI PatchWorker(void* context)
                 optiscaler_host::RouteName(host.route), uiDelegated ? L"optiscaler" : L"rtxmfg",
                 host.productVersion, host.fileVersion, host.path, host.pluginCallerAccepted);
     }
+#if MFG_UNLOCK_XESS
+    bool xessStarted = false;
+    const auto startXess = [&] {
+        xessStarted = true;
+        const bool xessImportsReady = xess_mod::InstallImports(static_cast<HMODULE>(context));
+        if (!xessImportsReady)
+            Log(L"XESS SDK discovery disabled: backend module ownership/pin verification failed.");
+        xess_mod::InitializeOutsideLoaderLock();
+        xess_mod::ConfigureModel(initialControl.xessModel, OptiScalerHostModel());
+        if (xessImportsReady)
+            xess_mod::DiscoverSdkModules();
+    };
+    // xefgrace.1: under OptiScaler the XeFG route comes first. OptiScaler resolves its XeFG
+    // exports before plug-ins load and can create its context a few hundred ms after start
+    // (Trails in the Sky 2nd Chapter, DX11): a context created before the detours stays
+    // stock 2x. The NVIDIA profile, Streamline hooks and module inventory below do not gate
+    // it. Without OptiScaler the route stays idle and the order below is unchanged.
+    if (optiscaler_host::Detected())
+        startXess();
+#endif
+    ResolveNvidiaCompatibilityPolicy();
     FILETIME configWriteTime{};
     ReadLastWriteTime(gConfigPath, configWriteTime);
     Log(L"Initial control: mode=%s multiplier=%ux dynamicTarget=%u FPS "
@@ -8608,7 +9627,7 @@ DWORD WINAPI PatchWorker(void* context)
     LogAmpereArchitectureDetection(ampere_provider_arch::DetectAndArm());
     Log(L"Diagnostics reused per executable: log=%s status=%s processBirth=%llu executable=%s",
         logPath.c_str(),gStatusPath.c_str(),static_cast<unsigned long long>(diagnostic_paths::ProcessBirth()),executablePath.c_str());
-    Log(L"RTXMFG build=1.5.0-hotfix.1 source=v1.5-flipmeter-20261006 base=intel6.6+optiscaler.1+ring2.3+dltb.2+slhost.1+flipmeter.18+hairdiscovery.1.4.2+reflexfg.2+capture.2+optixell.1+optiout.1+optipace.1+model2x.1+mvfill.1+uioff.1+uistable.1+mfgport.1+hudmatch.1+optiport.1+optcapture.1+optiportdefault.1+xefgdiscovery.1+slrestart.1+nvapipin.1+modeltoggle.1+uirefresh.1+noport.1+optiredirect.1+reflexport.1+portback.1+optionly.1+delayload.1+rtx30.3+xellungated.1+specialk.1a+themidaimports.1+modelchoice.1+xefgmodel.1+splat.2+scenechange.1+xellinput.1+rtx30sl2732.1+mfgunlocker.1+presetc.3+rtx30presetc.1+rtx30stable.1+rtx30ota.1+releaseleak.1 outputPullMask=%d occupancyHint=%d "
+    Log(L"RTXMFG build=1.6.0 source=v1.5-flipmeter-20261006 base=intel6.6+optiscaler.1+ring2.3+dltb.2+slhost.1+flipmeter.18+hairdiscovery.1.4.2+reflexfg.2+capture.2+optixell.1+optiout.1+optipace.1+model2x.1+mvfill.1+uioff.1+uistable.1+mfgport.1+hudmatch.1+optiport.1+optcapture.1+optiportdefault.1+xefgdiscovery.1+slrestart.1+nvapipin.1+modeltoggle.1+uirefresh.1+noport.1+optiredirect.1+reflexport.1+portback.1+optionly.1+delayload.1+rtx30.3+xellungated.1+specialk.1a+themidaimports.1+modelchoice.1+xefgmodel.1+splat.2+scenechange.1+xellinput.1+rtx30sl2732.1+mfgunlocker.1+presetc.3+rtx30presetc.1+rtx30stable.1+rtx30ota.1+cudawrapped.2+l10n.7+pin.4+turing.1+sm120.1+unet.1+nvlist.1+rtx30nvapi.1+rtx30buffers.1+gpuname.1+arcnative.3+rtx30flip.2+cudaowner.1+dredtable.1+optidlssg.1+xefgflipmeter.2+releaseleak.1+flipkey.1+cap6.1+optirtx30.1+livepreset.2+routegen.1+hitch.1+xefg134.1+rtx30vulkan.1+vkholes.1+vkvsync.1+vkfps.1+srpreset.1+srpreset.2+srpreset.3+srpreset.4+seam.1+scene.1+logpath.1+rtx20dlssg.1+slinitloop.1+lean160.1+xefgrace.1+latency.1 outputPullMask=%d occupancyHint=%d "
         L"uiInputs=framed-observations uiRecomposition=game-managed",
         MFG_UNLOCK_OUTPUT_PULL_MASK_ONLY,
         MFG_UNLOCK_OUTPUT_PULL_MASK_OCCUPANCY);
@@ -8694,13 +9713,8 @@ DWORD WINAPI PatchWorker(void* context)
     PublishLiveBridge(initialControl);
     ControlConfig activeControl = initialControl;
 #if MFG_UNLOCK_XESS
-    const bool xessImportsReady = xess_mod::InstallImports(static_cast<HMODULE>(context));
-    if (!xessImportsReady)
-        Log(L"XESS SDK discovery disabled: backend module ownership/pin verification failed.");
-    xess_mod::InitializeOutsideLoaderLock();
-    xess_mod::ConfigureModel(initialControl.xessModel, OptiScalerHostModel());
-    if (xessImportsReady)
-        xess_mod::DiscoverSdkModules();
+    if (!xessStarted)
+        startXess();
     uint32_t xessDiscoveryTicks = 0;
 #endif
     reflex_control::SetRuntimeValidator(&ReflexRuntimeCurrent);
@@ -8830,7 +9844,7 @@ DWORD WINAPI PatchWorker(void* context)
 }
 
 BOOL SampleFrameTelemetry(uint64_t owner, uint32_t presentCount,
-    bool outputAvailable, bool cumulative)
+    bool outputAvailable, bool cumulative, bool dlssgPresented = false)
 {
     gFpsOutputPresentTick.store(GetTickCount64(), std::memory_order_release);
     std::lock_guard telemetryLock(gFpsTelemetryMutex);
@@ -8861,7 +9875,9 @@ BOOL SampleFrameTelemetry(uint64_t owner, uint32_t presentCount,
         gFpsTelemetryActive = true;
     }
 
-    if (cumulative)
+    if (dlssgPresented)
+        UpdateFpsTelemetryForOutputPresent(0u, false, kFpsOutputDlssgPresented);
+    else if (cumulative)
     {
         const auto delta = gFpsPresentCounter.Sample(owner, presentCount,
             GetTickCount64(), outputAvailable);
@@ -8877,6 +9893,11 @@ void frame_telemetry::SamplePresentCounter(
     uint64_t owner, uint32_t count, bool available)
 {
     SampleFrameTelemetry(owner, count, available, true);
+}
+
+void frame_telemetry::SampleVulkanPresent()
+{
+    SampleFrameTelemetry(0, 0, false, false, true);
 }
 
 extern "C" __declspec(dllexport) BOOL WINAPI MfgUnlockSampleFrameTelemetry()
@@ -8923,6 +9944,14 @@ extern "C" BOOL WINAPI MfgUnlockCoreEntry(HINSTANCE instance, DWORD reason, LPVO
                 optiscaler_host::SetUiOptIn(saved.optiScalerUi == 1);
         }
         dlssg_preset::SetInitialSelectionLoader(&ReadInitialDlssgPreset);
+        dlssg_preset::SetCreateQuiescenceProbe(&ampere_backend::FrameGenerationQuiescent);
+        dlss_sr::SetLogCallback(&MidpointLog);
+        dlss_sr::SetInitialSelectionLoader(&ReadInitialDlssSrPreset);
+        dlss_sr::SetInitialRrSelectionLoader(&ReadInitialDlssRrPreset);
+        dlss_sr::SetDrsHookInstaller(&InstallDlssSrDrsHook);
+        dlss_sr::SetRuntimeEligibilityProbe(&gpu_dispatch::IsAda);
+        dlssg_preset::SetSettingFilter(dlss_sr::kDrsPresetSetting, &dlss_sr::FilterDrsRead);
+        dlssg_preset::SetSettingFilter(dlss_sr::kDrsRrPresetSetting, &dlss_sr::FilterDrsRead);
         if (HMODULE interposer = GetModuleHandleW(L"sl.interposer.dll"))
         {
             const std::wstring path = LoadedModulePath(interposer);

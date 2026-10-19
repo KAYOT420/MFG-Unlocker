@@ -7,15 +7,15 @@ namespace streamline_ota_policy
 constexpr uint64_t kAllowOta = 1ull << 3;
 constexpr uint64_t kLoadDownloadedPlugins = 1ull << 6;
 // Same values as gpu_dispatch::Family, checked at the integration boundary.
-enum class Gpu : uint32_t { eUnknown, eAda, eAmpere, eConflict };
+enum class Gpu : uint32_t { eUnknown, eAda, eAmpere, eConflict, eTuring };
 constexpr Gpu InventoryGpu(bool detected, uint32_t count, uint32_t architecture, bool ampereRtx) noexcept
 {
-    return !detected || count != 1 ? Gpu::eUnknown : ampereRtx ? Gpu::eAmpere
+    return !detected || count != 1 ? Gpu::eUnknown : ampereRtx ? (architecture == 0x160 ? Gpu::eTuring : Gpu::eAmpere)
         : architecture == 0x190 ? Gpu::eAda : Gpu::eUnknown;
 }
 enum class Reason : uint32_t
 { eNotListed, eNativePinned, eUnknownGpu, eConflict, eHost, eLoader,
-  eSelectedAda, eSelectedAmpere, eEarlyAda, eEarlyAmpere };
+  eSelectedAda, eSelectedAmpere, eEarlyAda, eEarlyAmpere, eSelectedTuring, eEarlyTuring };
 constexpr const char* ReasonName(Reason reason) noexcept
 {
     switch (reason)
@@ -30,6 +30,8 @@ constexpr const char* ReasonName(Reason reason) noexcept
     case Reason::eSelectedAmpere: return "selected-ampere";
     case Reason::eEarlyAda: return "early-nvapi-ada";
     case Reason::eEarlyAmpere: return "early-nvapi-ampere";
+    case Reason::eSelectedTuring: return "selected-turing";
+    case Reason::eEarlyTuring: return "early-nvapi-turing";
     default: return "unknown";
     }
 }
@@ -50,13 +52,14 @@ constexpr Result Apply(uint64_t flags, bool officialSixX,
 {
     const Gpu gpu = selected == Gpu::eUnknown ? early : selected;
     const bool enable = officialSixX && !nativePinned && coherentHost
-        && loaderDiscoveryReady && (gpu == Gpu::eAda || gpu == Gpu::eAmpere);
+        && loaderDiscoveryReady && (gpu == Gpu::eAda || gpu == Gpu::eAmpere || gpu == Gpu::eTuring);
     const Reason reason = !officialSixX ? Reason::eNotListed : nativePinned ? Reason::eNativePinned
         : gpu == Gpu::eConflict ? Reason::eConflict
-        : gpu != Gpu::eAda && gpu != Gpu::eAmpere ? Reason::eUnknownGpu
+        : gpu != Gpu::eAda && gpu != Gpu::eAmpere && gpu != Gpu::eTuring ? Reason::eUnknownGpu
         : !coherentHost ? Reason::eHost : !loaderDiscoveryReady ? Reason::eLoader
         : selected == Gpu::eAda ? Reason::eSelectedAda : selected == Gpu::eAmpere ? Reason::eSelectedAmpere
-        : gpu == Gpu::eAda ? Reason::eEarlyAda : Reason::eEarlyAmpere;
+        : selected == Gpu::eTuring ? Reason::eSelectedTuring
+        : gpu == Gpu::eAda ? Reason::eEarlyAda : gpu == Gpu::eTuring ? Reason::eEarlyTuring : Reason::eEarlyAmpere;
     const uint64_t adjusted = enable
         ? flags | kAllowOta | kLoadDownloadedPlugins : flags;
     return {

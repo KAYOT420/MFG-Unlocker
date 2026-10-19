@@ -1,4 +1,4 @@
-﻿param(
+param(
     [Parameter(Mandatory = $true)][string]$NativeCacheRoot,
     [Parameter(Mandatory = $true)][string]$StreamlineRoot,
     [Parameter(Mandatory = $true)][string]$ImGuiRoot,
@@ -9,6 +9,7 @@
     [string]$VisualStudioInstance = 'C:/Program Files/Microsoft Visual Studio/2022/Professional',
     [string]$MsvcToolsVersion = '14.38.33130',
     [string]$WindowsSdkVersion = '10.0.22621.0',
+    [string]$CudaRoot = 'C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.2',
     [string]$BuildDirectory = (Join-Path $PSScriptRoot '../../build/native'),
     [switch]$EnableGpuFaultCapture,
     [switch]$SkipOverlayGpuWork,
@@ -120,6 +121,8 @@ Assert-InputHash (Join-Path $XessSdkRoot 'inc/xell/xell_d3d12.h') 'E3B07F2F3ADC3
 Assert-InputHash (Join-Path $StreamlineRoot 'external/nvapi/nvapi.h') '4EE1BFF7568CEEC72124B8B3E43BF65CCB69DBB878B08C634B128F7EDCD28F3B'
 Assert-InputHash (Join-Path $StreamlineRoot 'external/nvapi/nvapi_lite_common.h') '5DDC178D1D504B89907DAD59D41D670E92647E5B7847D4DE1461E6765D8871E8'
 Assert-InputHash (Join-Path $XessProgramsRoot 'programs/programs.tsv') 'D74BD783D29280ED372653701CE9B0395362E381FAACE1213206E0BDD9BFC9E5'
+# V1.5.1 tensorcore.1: CUDA Toolkit 13.2 nvcc for the XeFG tensor-core kernels (version and output pinned by the generator).
+if (-not (Test-Path -LiteralPath (Join-Path $CudaRoot 'bin/nvcc.exe') -PathType Leaf)) { throw "CUDA Toolkit 13.2 nvcc missing: $CudaRoot" }
 
 if (-not (Test-Path -LiteralPath (Join-Path $sourceDirectory 'CMakeLists.txt') -PathType Leaf)) {
     throw "Corrected source snapshot is incomplete: $sourceDirectory"
@@ -141,6 +144,7 @@ $arguments = @(
     '-DMFG_UNLOCK_XESS=ON',
     "-DXESS_SDK_ROOT=$XessSdkRoot",
     "-DXESS_PROGRAMS_ROOT=$XessProgramsRoot",
+    "-DMFG_CUDA_ROOT=$CudaRoot",
     "-DVULKAN_INCLUDE_DIR=$VulkanIncludeDirectory",
     "-DGLSLANG_VALIDATOR=$(Join-Path $VulkanIncludeDirectory ../Bin/glslangValidator.exe)",
     '-DMFG_UNLOCK_BUILD_SINGLE_MODULE=ON',
@@ -204,6 +208,7 @@ Assert-CacheValue 'MFG_UNLOCK_OUTPUT_PULL_MASK_ONLY' 'ON'
 Assert-CacheValue 'MFG_UNLOCK_XESS' 'ON'
 Assert-CachePath 'XESS_SDK_ROOT' $XessSdkRoot
 Assert-CachePath 'XESS_PROGRAMS_ROOT' $XessProgramsRoot
+Assert-CachePath 'MFG_CUDA_ROOT' $CudaRoot
 Assert-CacheValue 'MFG_UNLOCK_OUTPUT_PULL_MASK_OCCUPANCY' 'OFF'
 Assert-CacheValue 'MFG_UNLOCK_BOUNDED_OVERLAY_REDESIGN' $EnableBoundedOverlayRedesign.IsPresent.ToString().ToUpperInvariant()
 Assert-CacheValue 'MFG_UNLOCK_OVERLAY_MENU_DRAW' $EnableOverlayMenuDraw.IsPresent.ToString().ToUpperInvariant()

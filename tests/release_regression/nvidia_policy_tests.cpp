@@ -4,13 +4,14 @@
 using namespace nvidia_mfg_policy;
 static unsigned checks = 0, failures = 0;
 static void Check(bool ok, const char* message) {
-    ++checks; failures += !ok; std::printf("%s %s\n", ok ? "PASS" : "FAIL", message);
+    ++checks; if (!ok) { ++failures; std::printf("FAIL %s\n", message); }
 }
 int wmain(int argc, wchar_t** argv) {
     Check(FindTier(L"Marvel's Spider-Man Remastered") == Tier::eNoMfgOverride, "Remastered is FG-only in NVIDIA table");
     Check(FindTier(L"Marvel's Spider-Man: Miles Morales") == Tier::eNoMfgOverride, "Miles Morales is FG-only");
     Check(FindTier(L"Marvel's Spider-Man 2") == Tier::eFourX, "Spider-Man 2 has 4x ceiling");
     Check(FindTier(L"Cyberpunk 2077") == Tier::eSixX, "Cyberpunk has 6x ceiling");
+    Check(FindTier(L"Dragon's Dogma 2") == Tier::eSixX, "Dragon's Dogma 2 has 6x ceiling (issue 94)");
     Check(FindTier(L"Definitely Unknown Title 6725") == Tier::eUnknown, "unmatched title stays unknown");
     Check(FindTier(L"Marvel's Spider-Man") == Tier::eUnknown, "partial title cannot borrow sequel policy");
     Check(FindTier(L"Alan Wake Remastered") == Tier::eUnknown, "SR-only row does not imply FG or MFG");
@@ -22,6 +23,7 @@ int wmain(int argc, wchar_t** argv) {
                 Check(result.effectiveMaximumMultiplier <= NativeMaximumMultiplier(compiled), "policy cannot expand compiled bound");
                 Check(result.nvidiaCeilingMultiplier == 0 || result.effectiveMaximumMultiplier <= result.nvidiaCeilingMultiplier, "override never exceeds per-game ceiling");
                 Check(patched || result.effectiveMaximumMultiplier == 2, "unpatched route cannot advertise higher modes");
+                Check(result.fallback == (result.nvidiaCeilingMultiplier > result.effectiveMaximumMultiplier), "fallback reports runtime restriction separately");
                 Check(LimitToPolicy(tier, result.effectiveMaximumMultiplier) == result.effectiveMaximumMultiplier, "shared backend bound is idempotent");
             }
         }

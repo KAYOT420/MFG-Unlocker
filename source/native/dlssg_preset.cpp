@@ -2,6 +2,7 @@
 #include "dlssg_preset_policy.h"
 #include "dlssg_provider_policy.h"
 #include "entry_detour.h"
+#include "dlssg_preset_config.h"
 
 #include <intrin.h>
 #include <algorithm>
@@ -11,6 +12,7 @@
 #include <cwchar>
 #include <limits>
 #include <mutex>
+#include <shared_mutex>
 #include <utility>
 
 namespace dlssg_preset
@@ -21,6 +23,16 @@ using GetSetting = int32_t (__cdecl*)(void*, void*, uint32_t, Setting*);
 using QueryInterface = void* (__cdecl*)(uint32_t);
 constexpr uint32_t kGetSettingInterface = 0x73BF8338u;
 std::atomic<GetSetting> gOriginal{nullptr};
+std::array<std::atomic<uint32_t>, 4> gFilterIds{};
+std::atomic<SettingFilter> gFilter{nullptr};
+
+bool Filtered(uint32_t id) noexcept
+{
+    if (!id) return false;
+    for (const auto& filtered : gFilterIds)
+        if (filtered.load(std::memory_order_acquire) == id) return true;
+    return false;
+}
 std::atomic<bool> gInstalled{false};
 std::atomic<uint32_t> gFailure{0};
 std::mutex gInstallMutex;
@@ -30,15 +42,33 @@ SelectionSnapshot gSelection;
 bool gSelectionInitialized = false;
 std::once_flag gInitialSelectionOnce;
 std::atomic<InitialSelectionLoader> gInitialSelectionLoader{nullptr};
+enum class ReadSource : uint8_t { eNvapi, eCached, eRoute, eConfiguration, eReport };
 struct ProviderRead
 {
     HMODULE module = nullptr;
     uint64_t count = 0;
     uint64_t overrides = 0;
+    uint64_t configurationReads = 0;
+    uint64_t reportReads = 0;
     uint32_t value = 0;
     bool valueValid = false;
 };
 std::array<ProviderRead, 64> gReads{};
+bool gReadOverflow = false; // Protected by gReadMutex; unknown readers deny reset.
+// The driver's own answer to a provider's NVAPI preset query that this process
+// overrode. Cached-reader providers keep that answer in a per-process DRS cache
+// filled once, so after an override the cache holds the override; a later
+// Game / driver selection replays the driver's answer instead (V1.6.0).
+struct DriverRead
+{
+    HMODULE module = nullptr;
+    int32_t result = 0;
+    uint32_t value = 0;
+    bool overridden = false;
+};
+std::array<DriverRead, 64> gDriverReads{};
+std::atomic<CreateQuiescenceProbe> gQuiescenceProbe{nullptr};
+std::atomic<bool> gResetDenied{false};
 using CachedGetSetting = bool (*)(uint32_t, uint32_t*);
 struct CachedReader
 {
@@ -47,9 +77,27 @@ struct CachedReader
     std::atomic<uint64_t> generation{0};
     std::atomic<uint64_t> reads{0};
     std::atomic<uint32_t> failure{0};
+    config::Layout config{}; // Immutable before module's release publication.
+    std::atomic<bool> configReady{false};
+    std::atomic<uint64_t> resets{0};
 };
 std::array<CachedReader, 64> gCachedReaders{};
 std::mutex gCachedInstallMutex;
+// Covers every endpoint, including EstimateVRAM's temporary endpoint and all
+// graphics APIs. Reset never waits for this gate while holding the selection
+// lock: a failed try-lock leaves the saved request pending for the next call.
+std::shared_mutex gEndpointGate;
+thread_local uint32_t gEndpointDepth = 0;
+struct EndpointCallScope
+{
+    std::shared_lock<std::shared_mutex> lock{gEndpointGate, std::defer_lock};
+    EndpointCallScope()
+    {
+        if (!gEndpointDepth) lock.lock();
+        ++gEndpointDepth;
+    }
+    ~EndpointCallScope() { --gEndpointDepth; }
+};
 // Preset C reaches only providers that implement it. Providers are retained for the
 // process, so a module handle keeps one answer.
 struct PresetCSupport
@@ -60,7 +108,8 @@ struct PresetCSupport
 std::array<PresetCSupport, 64> gPresetC{};
 std::mutex gPresetCMutex;
 
-void RecordRead(HMODULE provider, bool valueValid, uint32_t value, bool overridden) noexcept
+void RecordRead(HMODULE provider, bool valueValid, uint32_t value, bool overridden,
+    ReadSource source = ReadSource::eNvapi) noexcept
 {
     std::lock_guard lock(gReadMutex);
     for (auto& read : gReads)
@@ -69,10 +118,45 @@ void RecordRead(HMODULE provider, bool valueValid, uint32_t value, bool overridd
         read.module = provider;
         ++read.count;
         read.overrides += overridden ? 1 : 0;
-        read.value = valueValid ? value : 0;
-        read.valueValid = valueValid;
+        read.configurationReads += source == ReadSource::eConfiguration ? 1 : 0;
+        read.reportReads += source == ReadSource::eReport ? 1 : 0;
+        // NVAPI fills a DRS cache, and ReportOverrideStates only reports. Neither
+        // proves that EndpointConfiguration consumed the returned preset.
+        if (source == ReadSource::eConfiguration)
+        {
+            read.value = valueValid ? value : 0;
+            read.valueValid = valueValid;
+        }
+        return;
+    }
+    gReadOverflow = true;
+}
+
+void RecordDriverRead(HMODULE provider, int32_t result, uint32_t value, bool overridden) noexcept
+{
+    std::lock_guard lock(gReadMutex);
+    for (auto& read : gDriverReads)
+    {
+        if (read.module && read.module != provider) continue;
+        read = {provider, result, value, overridden};
         break;
     }
+}
+
+// Game / driver on a provider whose DRS cache holds this process's override:
+// the driver's recorded answer. False when the cache holds the driver's value.
+bool ReplayDriverRead(HMODULE provider, bool& found, uint32_t& value) noexcept
+{
+    std::lock_guard lock(gReadMutex);
+    for (const auto& read : gDriverReads)
+    {
+        if (read.module != provider) continue;
+        if (!read.overridden) return false;
+        found = read.result == kOk;
+        value = read.value;
+        return true;
+    }
+    return false;
 }
 
 bool PresetCSupported(HMODULE provider) noexcept
@@ -237,11 +321,20 @@ __declspec(noinline) bool HookCachedReader(uint32_t id, uint32_t* value) noexcep
         const uint32_t preset = EffectivePreset(FreezeSelection(), provider);
         const bool overridden = IsOverride(preset);
         bool result = true;
+        uint32_t driverValue = 0;
         if (overridden) *value = preset;
+        else if (ReplayDriverRead(provider, result, driverValue))
+        {
+            // The DRS cache holds an override from the selection that froze before.
+            if (result) *value = driverValue;
+        }
         else result = original(id, value);
         reader.reads.fetch_add(1, std::memory_order_relaxed);
         const bool valueValid = result && Writable(value, sizeof(*value));
-        RecordRead(provider, valueValid, valueValid ? *value : 0, overridden);
+        const auto address = reinterpret_cast<uintptr_t>(caller);
+        const auto source = address == reader.config.configurationReturn ? ReadSource::eConfiguration
+            : reader.config.report.Contains(address) ? ReadSource::eReport : ReadSource::eCached;
+        RecordRead(provider, valueValid, valueValid ? *value : 0, overridden, source);
         return result;
     }
     return original(id, value);
@@ -253,6 +346,56 @@ constexpr auto CachedThunks(std::index_sequence<Index...>) noexcept
     return std::array<CachedGetSetting, sizeof...(Index)>{&HookCachedReader<Index>...};
 }
 constexpr auto kCachedThunks = CachedThunks(std::make_index_sequence<64>{});
+
+using EndpointCreate = uint32_t (*)(void*, void*, void*, void*, uintptr_t, uintptr_t);
+using EndpointEvaluate = uint32_t (*)(void*, void*, void*, void*);
+
+template<size_t Index>
+uint32_t HookEndpointCreate(void* a, void* b, void* c, void* d, uintptr_t e, uintptr_t f)
+{
+    EndpointCallScope gate;
+    const auto state = entry_detour::ReadSnapshot(entry_detour::Kind::eDlssgEndpointCreate,
+        gCachedReaders[Index].module.load(std::memory_order_acquire));
+    const auto original = reinterpret_cast<EndpointCreate>(state.original);
+    return original ? original(a, b, c, d, e, f) : 0xbad00001u;
+}
+
+template<size_t Index>
+uint32_t HookEndpointEvaluate(void* a, void* b, void* c, void* d)
+{
+    EndpointCallScope gate;
+    const auto state = entry_detour::ReadSnapshot(entry_detour::Kind::eDlssgEndpointEvaluate,
+        gCachedReaders[Index].module.load(std::memory_order_acquire));
+    const auto original = reinterpret_cast<EndpointEvaluate>(state.original);
+    return original ? original(a, b, c, d) : 0xbad00001u;
+}
+
+template<size_t... I>
+constexpr auto CreateThunks(std::index_sequence<I...>) noexcept
+{ return std::array<EndpointCreate, sizeof...(I)>{&HookEndpointCreate<I>...}; }
+template<size_t... I>
+constexpr auto EvaluateThunks(std::index_sequence<I...>) noexcept
+{ return std::array<EndpointEvaluate, sizeof...(I)>{&HookEndpointEvaluate<I>...}; }
+constexpr auto kCreateThunks = CreateThunks(std::make_index_sequence<64>{});
+constexpr auto kEvaluateThunks = EvaluateThunks(std::make_index_sequence<64>{});
+
+bool ConfigHooksCurrent(const CachedReader& reader) noexcept
+{
+    if (!reader.configReady.load(std::memory_order_acquire)) return false;
+    const auto module = reader.module.load(std::memory_order_acquire);
+    const auto generation = reader.generation.load(std::memory_order_acquire);
+    for (auto kind : {entry_detour::Kind::eDlssgCachedPresetRead,
+        entry_detour::Kind::eDlssgEndpointCreate, entry_detour::Kind::eDlssgEndpointEvaluate})
+    {
+        const auto hook = entry_detour::ReadSnapshot(kind, module);
+        const auto target = kind == entry_detour::Kind::eDlssgCachedPresetRead
+            ? reinterpret_cast<uintptr_t>(reader.target.load(std::memory_order_acquire))
+            : kind == entry_detour::Kind::eDlssgEndpointCreate ? reader.config.create.begin : reader.config.evaluate.begin;
+        if (!hook.current || hook.generation != generation || reinterpret_cast<uintptr_t>(hook.target) != target)
+            return false;
+    }
+    return true;
+}
 
 void InstallCachedReader(HMODULE module, uint64_t generation) noexcept
 {
@@ -268,6 +411,7 @@ void InstallCachedReader(HMODULE module, uint64_t generation) noexcept
         if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
                 | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(module), &pinned)
             || pinned != module) return;
+        reader.config = config::Discover(module, target);
         reader.target.store(target, std::memory_order_relaxed);
         reader.generation.store(generation, std::memory_order_relaxed);
         reader.failure.store(target ? 0 : 4, std::memory_order_relaxed);
@@ -282,6 +426,16 @@ void InstallCachedReader(HMODULE module, uint64_t generation) noexcept
         const auto state = entry_detour::ReadSnapshot(entry_detour::Kind::eDlssgCachedPresetRead, module);
         reader.failure.store(installed && state.current ? 0 : 100u+static_cast<uint32_t>(state.failure),
             std::memory_order_release);
+        if (!installed || !state.current || !reader.config.slot) return;
+        // The module is already pinned. Discover both entries before installing
+        // either; partial installation stays transparent and cannot enable reset.
+        bool create = entry_detour::Install(entry_detour::Kind::eDlssgEndpointCreate, module,
+            reinterpret_cast<void*>(reader.config.create.begin), reinterpret_cast<void*>(kCreateThunks[index]),
+            original, options);
+        bool evaluate = entry_detour::Install(entry_detour::Kind::eDlssgEndpointEvaluate, module,
+            reinterpret_cast<void*>(reader.config.evaluate.begin), reinterpret_cast<void*>(kEvaluateThunks[index]),
+            original, options);
+        reader.configReady.store(create && evaluate, std::memory_order_release);
         return;
     }
 }
@@ -296,6 +450,12 @@ __declspec(noinline) int32_t __cdecl HookGetSetting(
     // use it for calls racing publication of the fast-path pointer.
     if (!original) original = reinterpret_cast<GetSetting>(detour.original);
     if (!original) return -1;
+    if (const auto filter = gFilter.load(std::memory_order_acquire);
+        filter && id != kSettingId && Filtered(id))
+    {
+        const int32_t result = original(session, profile, id, setting);
+        return filter(id, result, setting, detour.current && Writable(setting, sizeof(*setting)), Owner(caller));
+    }
     const HMODULE provider = Owner(caller);
     const bool eligible = detour.current && id == kSettingId
         && dlssg_provider_policy::IsSupportedRetainedProvider(provider)
@@ -313,7 +473,9 @@ __declspec(noinline) int32_t __cdecl HookGetSetting(
             | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(caller), &pinned)
         || pinned != provider)
         return result;
+    const uint32_t driverValue = result == kOk ? setting->current.dword : 0;
     const bool overridden = OverrideRead(id, result, *setting, preset);
+    RecordDriverRead(provider, result, driverValue, overridden);
     const bool valueValid = overridden || result == kOk;
     RecordRead(provider, valueValid, valueValid ? setting->current.dword : 0, overridden);
     return overridden ? kOk : result;
@@ -382,7 +544,99 @@ SelectionSnapshot ReadSelection() noexcept
 
 void RecordProviderRead(HMODULE provider, bool valueValid, uint32_t value, bool overridden) noexcept
 {
-    if (provider) RecordRead(provider, valueValid, value, overridden);
+    if (provider) RecordRead(provider, valueValid, value, overridden, ReadSource::eRoute);
+}
+
+void SetCreateQuiescenceProbe(CreateQuiescenceProbe probe) noexcept
+{
+    gQuiescenceProbe.store(probe, std::memory_order_release);
+}
+
+bool RelatchPending() noexcept
+{
+    const auto probe = gQuiescenceProbe.load(std::memory_order_acquire);
+    if (gEndpointDepth) return false;
+    std::unique_lock gate(gEndpointGate, std::try_to_lock);
+    if (!gate.owns_lock()) return false;
+    std::lock_guard lock(gSelectionMutex);
+    if (!gSelection.selectionFrozen || gSelection.requested == gSelection.latched || !probe || !probe())
+        return false;
+    // Validate every provider that has consumed a preset before any write.
+    // Holding the endpoint gate excludes new Create/Evaluate calls even when
+    // they bypass the runtime tracker (for example the VRAM estimate callback).
+    std::array<CachedReader*, 64> selected{};
+    std::array<config::ResetState, 64> states{};
+    size_t count = 0;
+    std::lock_guard reads(gReadMutex);
+    if (gReadOverflow) { gResetDenied.store(true, std::memory_order_release); return false; }
+    for (const auto& read : gReads)
+    {
+        if (!read.module || !read.count) continue;
+        CachedReader* found = nullptr;
+        for (auto& reader : gCachedReaders)
+            if (reader.module.load(std::memory_order_acquire) == read.module) { found = &reader; break; }
+        if (!found || !ConfigHooksCurrent(*found) || !config::ReadResetState(found->config, states[count]))
+        { gResetDenied.store(true, std::memory_order_release); return false; }
+        selected[count++] = found;
+    }
+    for (size_t i = 0; i < count; ++i)
+    {
+        // Once a reset is attempted, old configuration evidence must not remain
+        // valid even if readback detects an external writer.
+        for (auto& read : gReads)
+            if (read.module == selected[i]->config.module) read.valueValid = false;
+        if (!config::Reset(selected[i]->config, states[i]))
+        { gResetDenied.store(true, std::memory_order_release); return false; }
+        if (states[i].object) selected[i]->resets.fetch_add(1, std::memory_order_relaxed);
+    }
+    for (auto& read : gReads) read.valueValid = false;
+    gSelection.latched = gSelection.requested;
+    gSelection.selectionFrozen = false;
+    gSelection.restartRequired = false;
+    return true;
+}
+
+bool ProviderSupportsLiveSwitch(HMODULE provider) noexcept
+{
+    if (gResetDenied.load(std::memory_order_acquire)) return false;
+    for (const auto& reader : gCachedReaders)
+    {
+        if (reader.module.load(std::memory_order_acquire) != provider) continue;
+        return ConfigHooksCurrent(reader);
+    }
+    return false;
+}
+
+bool ReadProvidersSupportLiveSwitch() noexcept
+{
+    std::array<HMODULE, 64> providers{};
+    size_t count = 0;
+    {
+        std::lock_guard lock(gReadMutex);
+        if (gReadOverflow) return false;
+        for (const auto& read : gReads)
+            if (read.module && read.count) providers[count++] = read.module;
+    }
+    for (size_t i = 0; i != count; ++i)
+        if (!ProviderSupportsLiveSwitch(providers[i])) return false;
+    return count != 0;
+}
+
+void SetSettingFilter(uint32_t id, SettingFilter filter) noexcept
+{
+    if (!filter)
+    {
+        gFilter.store(nullptr, std::memory_order_release);
+        for (auto& filtered : gFilterIds) filtered.store(0, std::memory_order_release);
+        return;
+    }
+    for (auto& filtered : gFilterIds)
+    {
+        uint32_t empty = 0;
+        if (filtered.load(std::memory_order_acquire) == id
+            || filtered.compare_exchange_strong(empty, id, std::memory_order_acq_rel)) break;
+    }
+    gFilter.store(filter, std::memory_order_release);
 }
 
 bool Prepare() noexcept
@@ -522,6 +776,10 @@ Snapshot ReadSnapshot(HMODULE provider) noexcept
             result.cachedReaderFailure = 100u+static_cast<uint32_t>(entry_detour::Failure::eHookConflict);
         result.cachedReaderRva = cached.targetRva;
         result.cachedReaderReads = reader.reads.load(std::memory_order_acquire);
+        result.configurationResetAvailable = ConfigHooksCurrent(reader);
+        result.configurationResets = reader.resets.load(std::memory_order_relaxed);
+        result.configurationSlotRva = reader.config.slot
+            ? static_cast<uint32_t>(reinterpret_cast<uintptr_t>(reader.config.slot) - reinterpret_cast<uintptr_t>(provider)) : 0;
         result.installed |= result.cachedReaderInstalled;
         if (result.cachedReaderInstalled) result.failure = 0;
         break;
@@ -532,6 +790,8 @@ Snapshot ReadSnapshot(HMODULE provider) noexcept
         {
             result.providerReads = read.count;
             result.overrideReads = read.overrides;
+            result.configurationReads = read.configurationReads;
+            result.reportReads = read.reportReads;
             result.observedPreset = read.value;
             result.observedPresetValid = read.valueValid;
             break;

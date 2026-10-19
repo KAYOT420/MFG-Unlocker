@@ -19,7 +19,7 @@ int wmain(int argc, wchar_t** argv)
     if(mode==L"legacy") saved=R"({"mode":"fixed","multiplier":4})";
     else if(mode==L"fixed") saved=R"({"followGame":false,"mode":"fixed","multiplier":3})";
     else if(mode==L"dynamic") saved=R"({"followGame":false,"mode":"dynamic","multiplier":4,"dynamicTargetFrameRate":120})";
-    else if(mode==L"follow") saved=R"({"followGame":true,"mode":"follow","multiplier":3})";
+    else if(mode==L"follow") saved=R"({"followGame":true,"mode":"follow","multiplier":2})";
     else if(mode!=L"clean"&&mode!=L"environment") return 2;
     if(std::filesystem::exists(config)) return 2; // Runner supplies an empty directory.
     if(!saved.empty()) std::ofstream(config)<<saved;
@@ -38,7 +38,7 @@ int wmain(int argc, wchar_t** argv)
     const bool follow=mode==L"clean"||mode==L"follow";
     check(has("followGame",follow?"true":"false"),"startup control preserves default or explicit follow intent");
     check(has("mode",follow?"\"follow\"":mode==L"dynamic"?"\"dynamic\"":"\"fixed\""),"startup mode matches requested semantics");
-    const char* multiplier=mode==L"fixed"||mode==L"follow"?"3":mode==L"environment"?"5":mode==L"legacy"||mode==L"dynamic"?"4":"2";
+    const char* multiplier=mode==L"fixed"?"3":mode==L"environment"?"5":mode==L"legacy"||mode==L"dynamic"?"4":"2";
     check(has("multiplier",multiplier),"saved or explicit multiplier is retained");
     if(mode==L"dynamic") check(has("dynamicTargetFrameRate","120"),"saved Dynamic target is retained");
     if(saved.empty()) check(!std::filesystem::exists(config),"default startup does not create an override file");

@@ -7,7 +7,7 @@ using namespace ampere_cuda_program;
 namespace
 {
 std::vector<void*> stack;
-int devices, capabilityMinor, loadError, functionError, unloadError, createError, failSlot;
+int devices, capabilityMajor, capabilityMinor, loadError, functionError, unloadError, createError, failSlot;
 bool changeContext, popError;
 int materializeError;
 unsigned materializations;
@@ -19,7 +19,7 @@ void Check(bool value, const char* message) { if (!value) throw std::runtime_err
 void Reset()
 {
     stack = {reinterpret_cast<void*>(0x1110), reinterpret_cast<void*>(0x2220)};
-    devices = 1; capabilityMinor = 6; failSlot = 0;
+    devices = 1; capabilityMajor = 8; capabilityMinor = 6; failSlot = 0;
     loadError = functionError = unloadError = createError = 0;
     changeContext = popError = false;
     loads = functions = unloads = creates = pops = destroys = 0;
@@ -29,7 +29,7 @@ void Reset()
 int WINAPI Init(unsigned) { return 0; }
 int WINAPI Count(int* n) { *n = devices; return 0; }
 int WINAPI Device(int* value, int ordinal) { *value = ordinal; return 0; }
-int WINAPI Capability(int* major, int* minor, int) { *major = 8; *minor = capabilityMinor; return 0; }
+int WINAPI Capability(int* major, int* minor, int) { *major = capabilityMajor; *minor = capabilityMinor; return 0; }
 int WINAPI Luid(char* value, unsigned* nodes, int) { uint64_t luid = 42; std::memcpy(value, &luid, 8); *nodes = 1; return 0; }
 int WINAPI Current(void** value) { *value = stack.empty() ? nullptr : stack.back(); return 0; }
 int WINAPI Create(void** value, unsigned flags, int device)
@@ -164,6 +164,23 @@ int main()
             Reset();
             result = detail::ValidateUsing(Api(), ampere_native_cache::ProgramView(complete), EntryView(completeEntries), 42);
             Check(!result.Ready() && creates == 0 && loads == 0, "out-of-range complete program count rejects before CUDA use");
+        }
+        {
+            ampere_native_cache::CompleteProgram network(39,{5,6,7,8});
+            std::vector<Entry> networkNames(39);
+            for(auto& n:networkNames)std::strcpy(n.data(),"main_kernel");
+            const std::vector<uint8_t> font{1,2,3,4};
+            Reset(); capabilityMajor=7;capabilityMinor=5;fontAt=25;
+            result=detail::ValidateUsing(Api(),ampere_native_cache::ProgramView(program),EntryView(entries),42,{&font,network,networkNames,75});
+            Check(result.Ready()&&loads==65&&unloads==65&&creates==1&&pops==1&&destroys==1&&stack.size()==2,
+                "Turing table, font and all 39 network images share one restored private context");
+            Reset(); capabilityMajor=7;capabilityMinor=5;
+            result=detail::ValidateUsing(Api(),ampere_native_cache::ProgramView(program),EntryView(entries),42);
+            Check(!result.Ready()&&creates==0,"SM86 program cannot validate on Turing");
+            Reset();capabilityMajor=7;capabilityMinor=5;fontAt=25;failSlot=64;loadError=218;
+            result=detail::ValidateUsing(Api(),ampere_native_cache::ProgramView(program),EntryView(entries),42,{&font,network,networkNames,75});
+            Check(!result.Ready()&&result.slot==64&&result.contextRestored&&loads==65&&unloads==64&&stack.size()==2,
+                "the final network failure rejects the complete Turing program and restores the caller");
         }
         puts("CUDA_PROGRAM_VALIDATION_PASSED: full program, kernel errors, adapter identity, context stack and cleanup ownership");
         return 0;
