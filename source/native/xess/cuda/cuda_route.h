@@ -10,7 +10,9 @@
 // Intel program's (tests/xess_cuda).
 //
 // Recognition is exact: a pipeline state counts only when the provider image created it from a
-// program whose SHA-256 is in the layer table. A Dispatch is replaced only when its recording
+// program whose SHA-256 is in the layer table: directly, through the wrapper of its device, or
+// (psorefused.1) through a module that hooks pipeline creation in between, the provider's image then
+// being a frame of a bounded stack walk above that module. A Dispatch is replaced only when its recording
 // state is complete on the recording thread and every handle resolves; anything else keeps the
 // Dispatch, which runs the DXIL port as before.
 //
@@ -44,6 +46,10 @@ bool Install(ID3D12Device* device, HMODULE providerModule, std::span<const unsig
 
 // The configuration turned the route off (OptiScaler.ini [XeFG] XeFGTensorCores = off).
 void Disable(const char* reason) noexcept;
+
+// psorefused.1 (tests): false restores the caller rule pipeline states had before (the provider is the caller, or the
+// first frame after the wrapper's), which lists always keep. On by default.
+void SetStackRecognition(bool enabled) noexcept;
 
 // No provider context remains: release the recognized pipeline states, give the provider's own list
 // tables their originals back and release those lists. The device hooks (and a shared table of a

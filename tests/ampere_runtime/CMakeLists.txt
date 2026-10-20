@@ -4,6 +4,8 @@ set(NATIVE_SOURCE "${CMAKE_CURRENT_LIST_DIR}/../../source/native")
 set(MINHOOK "${NATIVE_SOURCE}/third_party/minhook")
 set(MINHOOK_SOURCES "${MINHOOK}/src/buffer.c" "${MINHOOK}/src/hook.c" "${MINHOOK}/src/trampoline.c" "${MINHOOK}/src/hde/hde64.c")
 add_executable(AmpereBatchTests batch_tests.cpp)
+# slinitfg.1: the RTX 30/20 FG requirements answer during slInit/startup.
+add_executable(AmpereStartupRequirementsTests startup_requirements_tests.cpp)
 add_executable(AmpereOptionsTests options_tests.cpp)
 add_executable(AmpereFlipMeteringTests flip_metering_tests.cpp "${NATIVE_SOURCE}/ampere_flip_metering.cpp")
 # rtx30flip.1: the flip-metering opt-in (settings, SetFlipConfig observation, Active state).
@@ -75,7 +77,7 @@ add_executable(DlssgPresetHookInstallTests preset_hook_install_tests.cpp "${NATI
 target_link_libraries(DlssgPresetHookInstallTests PRIVATE version)
 add_executable(DlssSrOverrideAudit sr_override_audit.cpp "${NATIVE_SOURCE}/entry_detour.cpp"
     "${CMAKE_CURRENT_BINARY_DIR}/preset_entry_detour.asm" ${MINHOOK_SOURCES})
-foreach(target AmpereBatchTests AmpereOptionsTests AmpereFlipMeteringTests AmpereFlipObserverTests AmpereStatusFieldsTests StreamlineOtaTests AmpereArchitectureTests AmpereWrapperTests DlssgSelectionTests NvapiResolveTests GpuNameOverrideTests OptiScalerPrivateStartupTests DlssgPresetSwitchTests ${MFG_DLSS_SR_TESTS} AmpereVulkanRouteTests DlssgPresetHookInstallTests DlssSrOverrideAudit)
+foreach(target AmpereBatchTests AmpereStartupRequirementsTests AmpereOptionsTests AmpereFlipMeteringTests AmpereFlipObserverTests AmpereStatusFieldsTests StreamlineOtaTests AmpereArchitectureTests AmpereWrapperTests DlssgSelectionTests NvapiResolveTests GpuNameOverrideTests OptiScalerPrivateStartupTests DlssgPresetSwitchTests ${MFG_DLSS_SR_TESTS} AmpereVulkanRouteTests DlssgPresetHookInstallTests DlssSrOverrideAudit)
     target_compile_features(${target} PRIVATE cxx_std_20)
     target_include_directories(${target} PRIVATE "${NATIVE_SOURCE}" "${MINHOOK}/include")
     target_compile_definitions(${target} PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
@@ -93,7 +95,7 @@ target_compile_definitions(SelectionSibling PRIVATE FIXTURE_MINOR=9 FIXTURE_BUIL
 # No inputs: run with every build. The flip-metering, wrapper, selection and architecture tests take real
 # Streamline wrappers and DLSS-G providers as arguments (see BUILD.md).
 enable_testing()
-foreach(target AmpereBatchTests AmpereOptionsTests AmpereFlipObserverTests AmpereStatusFieldsTests StreamlineOtaTests OptiScalerPrivateStartupTests DlssgPresetSwitchTests ${MFG_DLSS_SR_TESTS} AmpereVulkanRouteTests)
+foreach(target AmpereBatchTests AmpereStartupRequirementsTests AmpereOptionsTests AmpereFlipObserverTests AmpereStatusFieldsTests StreamlineOtaTests OptiScalerPrivateStartupTests DlssgPresetSwitchTests ${MFG_DLSS_SR_TESTS} AmpereVulkanRouteTests)
     add_test(NAME ${target} COMMAND ${target})
 endforeach()
 # Exit code 2 is a setup failure (no NVIDIA driver or no split nvapi64_impl.dll), never a pass.

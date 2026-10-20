@@ -482,7 +482,7 @@ BOOL WINAPI NativeFileGetSnapshot(MfgUnlockReShadeSnapshot* snapshot)
         if (!haveSavedControl) ParseJsonBool(status, "followGame", output.followGameMode);
         ParseJsonInteger(status, "version",
             output.statusProtocolVersion);
-        if (!ParseJsonInteger(status, "gpuFamily", output.gpuFamily) || output.gpuFamily > 4u)
+        if (!ParseJsonInteger(status, "gpuFamily", output.gpuFamily) || output.gpuFamily > 5u)
             return FALSE;
         ParseJsonInteger(status, "gpuAdapterLuid", output.gpuAdapterLuid);
         ParseJsonInteger(status, "gpuSelectionFailure", output.gpuSelectionFailure);
@@ -924,7 +924,7 @@ BOOL WINAPI NativeFileApplyControl(uint32_t multiplier, BOOL dynamicMode,
     const BOOL followGame = multiplier == 0 && dynamicMode == FALSE;
     MfgUnlockReShadeSnapshot current{};
     if (!NativeFileGetSnapshot(&current)) return FALSE;
-    if (current.gpuFamily != 1u && current.gpuFamily != 2u && current.gpuFamily != 4u) return FALSE;
+    if (!xess_ui::DlssMfgFamily(current.gpuFamily)) return FALSE;
     if (UiAmpere())
     {
         if (!ampere_policy::ControlValid(followGame ? 2u : multiplier, dynamicMode != FALSE,
@@ -2127,7 +2127,8 @@ void GameRows(const MfgUnlockReShadeSnapshot& snapshot, bool familyDetail)
     const std::string gpu = !vendor ? std::string() : gXessUi.adapter.empty()
         ? std::string(VendorName(vendor)) : gXessUi.adapter;
     const char* family = !familyDetail ? "" : snapshot.gpuFamily == 1u ? "Ada (RTX 40)"
-        : snapshot.gpuFamily == 2u ? "Ampere (RTX 30)" : snapshot.gpuFamily == 4u ? "Turing (RTX 20)" : "";
+        : snapshot.gpuFamily == 2u ? "Ampere (RTX 30)" : snapshot.gpuFamily == 4u ? "Turing (RTX 20)"
+        : snapshot.gpuFamily == 5u ? "Blackwell (RTX 50)" : "";
     if (!gpu.empty())
         StatusDetail(T("GPU"), Tone::Normal, gpu.c_str(), family);
     else if (familyDetail && family[0])

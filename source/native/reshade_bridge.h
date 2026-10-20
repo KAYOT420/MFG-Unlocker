@@ -199,7 +199,7 @@ struct MfgUnlockReShadeSnapshot
     uint32_t ampereCandidateVersionBuild = 0;
     uint64_t ampereCreatedFeatures = 0;
     uint64_t ampereEvaluations = 0;
-    uint32_t gpuFamily = 0; // 0 unknown, 1 Ada, 2 Ampere, 3 conflict, 4 Turing RTX
+    uint32_t gpuFamily = 0; // 0 unknown, 1 Ada, 2 Ampere, 3 conflict, 4 Turing RTX, 5 Blackwell RTX
     uint64_t gpuAdapterLuid = 0;
     uint32_t gpuSelectionFailure = 0;
 

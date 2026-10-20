@@ -13,7 +13,10 @@ bool Install(Kind, HMODULE, void*, void*, void*& originalTrampoline) noexcept { 
 bool InstallForwarding(Kind, HMODULE, void*, ForwardPreCall, void*& originalTrampoline, const InstallOptions&,
     Handle*, ForwardGate, void*) noexcept
 { originalTrampoline = nullptr; return false; }
-Snapshot ReadSnapshot(Handle) noexcept { return {}; }
+// testHandle (if set) reports testHandleHook: an exact entry such as a route-owned preset reader.
+Handle testHandle{};
+Snapshot testHandleHook{};
+Snapshot ReadSnapshot(Handle handle) noexcept { return handle && handle == testHandle ? testHandleHook : Snapshot{}; }
 Snapshot ReadSnapshot(Kind) noexcept { return {}; }
 HMODULE testOwner = nullptr;
 std::array<Snapshot, static_cast<size_t>(Kind::eCount)> testHooks{};

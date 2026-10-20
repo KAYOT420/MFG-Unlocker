@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(RTX40MFGNative VERSION 1.6.0.1010 LANGUAGES C CXX ASM_MASM)
+project(RTX40MFGNative VERSION 1.6.1.1021 LANGUAGES C CXX ASM_MASM)
 option(MFG_UNLOCK_OVERLAY_SKIP_GPU_WORK "Isolated comparison: keep proxies/input but skip UI GPU work" OFF)
 option(MFG_UNLOCK_NGX_CREATE_RESULT_DIAGNOSTICS "Bounded NGX runtime Create results without DRED or new hooks" OFF)
 option(MFG_UNLOCK_GPU_FAULT_CAPTURE "Isolated local DRED and NGX result diagnostics" OFF)
@@ -51,6 +51,7 @@ set(MFG_UNLOCK_CORE_SOURCES
     patcher.cpp
     optiscaler_host.cpp
     midpoint_fix.cpp
+    blackwell_gpu.cpp
     gpu_dispatch.cpp
     ampere_gpu.cpp
     ampere_cuda_program.cpp

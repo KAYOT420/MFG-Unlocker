@@ -24,9 +24,19 @@ static_assert(sizeof(Params) == kParamsBytes);
 
 int main()
 {
-    wchar_t temp[MAX_PATH]{};
-    GetTempPathW(MAX_PATH, temp);
-    const std::wstring ini = std::wstring(temp) + L"AmpereFlipObserverTests-" + std::to_wstring(GetCurrentProcessId()) + L".ini";
+    // The ini goes beside this executable, not in %TEMP%: an executable under a
+    // folder with a Low mandatory label runs at Low integrity and cannot create
+    // files in the user's %TEMP%, but can in its own build folder.
+    wchar_t self[MAX_PATH]{};
+    const DWORD length = GetModuleFileNameW(nullptr, self, MAX_PATH);
+    std::wstring ini(self, length);
+    ini.resize(ini.find_last_of(L"\\/") + 1);
+    ini += L"AmpereFlipObserverTests-" + std::to_wstring(GetCurrentProcessId()) + L".ini";
+    if (!length || length >= MAX_PATH || !WritePrivateProfileStringW(kSection, kKey, L"1", ini.c_str()))
+    {
+        std::cout << "SETUP cannot write the test ini beside the executable (error " << GetLastError() << ")\n";
+        return 2;
+    }
     Check(WithValue(ini, nullptr) == Setting::eDefault, "missing file follows the default");
     Check(WithValue(ini, L"1") == Setting::eOn && WithValue(ini, L"TRUE") == Setting::eOn
         && WithValue(ini, L"on") == Setting::eOn, "1, true and on are on");

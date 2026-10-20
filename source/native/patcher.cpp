@@ -28,6 +28,13 @@
 #include "early_provider_load.h"
 namespace gpu_backend = gpu_dispatch;
 inline bool UseAmpere() noexcept { return gpu_dispatch::UsesTranslatedProgram(); }
+// DLSS-G presets (V1.6.1). Families whose unmodified provider gets this
+// process's own cached-reader, endpoint and NvAPI hooks (dlssg_preset): RTX 40
+// and RTX 50, whose DLSS-G provider runs its own program.
+inline bool NativeDlssgPresetGpu() noexcept { return gpu_dispatch::UsesNativeProgram(); }
+// Families whose DLSS-G, SR and RR presets can switch while the game runs: the
+// native families, and RTX 30/20, whose translated route owns its preset reader.
+inline bool LivePresetGpu() noexcept { return NativeDlssgPresetGpu() || UseAmpere(); }
 
 #include "dlssg_provider_policy.h"
 #include "dlssg_provider_selection.h"
@@ -393,7 +400,7 @@ struct ControlConfig
     uint32_t xessModel = 0;
     bool dynamicExperimental56 = false;
     bool generatedOnlyDebug = false;
-    bool intervalLogging = gpu_dispatch::IsAda() || UseAmpere();
+    bool intervalLogging = gpu_dispatch::UsesNativeProgram() || UseAmpere();
     // When OptiScaler is detected: 0 = its menu owns the controls (RTXMFG UI
     // hidden, Follow, no overrides); 1 = "rtxmfg" keeps RTXMFG's UI/controls.
     uint32_t optiScalerUi = 0;
@@ -771,14 +778,20 @@ nvidia_mfg_policy::CapacityDecision CurrentCapacityDecision() noexcept
 
 uint32_t SafeMaximumMultiplier() noexcept
 {
-    const uint32_t runtimeMaximum = UseAmpere()
+    uint32_t runtimeMaximum = UseAmpere()
         ? (ampere_backend::Ready()
             && ampere_backend::StartupMaximumGeneratedFrames() == ampere_policy::kMaximumGeneratedFrames
             && ampere_backend::CertifiedMaximumGeneratedFrames() == ampere_policy::kMaximumGeneratedFrames
             ? ampere_policy::kMaximumGeneratedFrames + 1u : 2u)
-        : gpu_dispatch::IsAda() ? std::clamp(
+        : gpu_dispatch::UsesNativeProgram() ? std::clamp(
             CurrentCapacityDecision().effectiveMaximumMultiplier,
             kMinimumMultiplier, kMaximumMultiplier) : 2u;
+    // RTX 50's unpatched wrapper clamps the count to the provider's own
+    // maximum as well; offer no mode above the one the provider reports.
+    if (gpu_dispatch::IsBlackwell())
+        if (const uint32_t reported = gNumFramesToGenerateMax.load(std::memory_order_acquire))
+            runtimeMaximum = std::min(runtimeMaximum,
+                std::clamp(reported + 1u, kMinimumMultiplier, kMaximumMultiplier));
     const uint32_t maximum = nvidia_mfg_policy::LimitToPolicy(
         static_cast<nvidia_mfg_policy::Tier>(
             gNvidiaCompatibilityTier.load(std::memory_order_acquire)), runtimeMaximum);
@@ -1590,14 +1603,14 @@ bool TryParseControl(const char* data, size_t size, ControlConfig& control)
         return false;
 
     size_t intervalLoggingOffset = 0;
-    bool legacyIntervalLogging = gpu_dispatch::IsAda() || UseAmpere();
+    bool legacyIntervalLogging = gpu_dispatch::UsesNativeProgram() || UseAmpere();
     if (FindJsonValue(content, "intervalLogging", intervalLoggingOffset)
         && !TryParseBoolean(content, "intervalLogging",
             legacyIntervalLogging))
         return false;
     // Both selected backends retain temporal-request tracing for FPS telemetry.
     // Accept legacy false settings without allowing them to disable collection.
-    parsed.intervalLogging = gpu_dispatch::IsAda() || UseAmpere()
+    parsed.intervalLogging = gpu_dispatch::UsesNativeProgram() || UseAmpere()
         || legacyIntervalLogging;
 
     size_t generatedOnlyOffset = 0;
@@ -1715,15 +1728,20 @@ ControlConfig EffectiveControl(const ControlConfig& saved) noexcept
     return effective;
 }
 
-// The DLSS SR preset uses the DLSS-G preset's NvAPI DRS read hook, installed
-// on RTX 40 only. The SR provider reads its DRS key when NGX initializes it, which
-// can come before anything selected a GPU family; the game's NGX device selects
-// RTX 40 here (ObserveAdaD3D12Device never selects RTX 30).
+// The DLSS SR preset uses the DLSS-G preset's NvAPI DRS read hook. The SR
+// provider reads its DRS key when NGX initializes it, which can come before
+// anything selected a GPU family; the game's NGX device selects RTX 40 or
+// RTX 50 here (ObserveNativeD3D12Device never selects RTX 30). RTX 30/20 select
+// their family in PrepareNgxInitialization, which calls this again (V1.6.1).
 bool InstallDlssSrDrsHook(ID3D12Device* device) noexcept
 {
-    if (!gpu_dispatch::IsAda() && gpu_dispatch::Selected() == gpu_dispatch::Family::eUnknown && device)
-        gpu_dispatch::ObserveAdaD3D12Device(device);
-    return gpu_dispatch::IsAda() && dlssg_preset::Prepare();
+    if (gpu_dispatch::Selected() == gpu_dispatch::Family::eUnknown && device)
+        gpu_dispatch::ObserveNativeD3D12Device(device);
+    if (!LivePresetGpu()) return false;
+    // Only native providers take the DLSS-G key from NvAPI; the translated
+    // route answers it at its own reader hook.
+    if (!NativeDlssgPresetGpu()) dlssg_preset::SetNvapiFrameGenerationReads(false);
+    return dlssg_preset::Prepare();
 }
 
 uint32_t ReadInitialDlssSrPreset() noexcept
@@ -1776,7 +1794,7 @@ uint64_t StoreControl(const ControlConfig& control)
     gDynamicExperimental56.store(control.dynamicExperimental56, std::memory_order_relaxed);
     gGeneratedOnlyDebug.store(control.generatedOnlyDebug,
         std::memory_order_relaxed);
-    temporal_interval_trace::SetEnabled(gpu_dispatch::IsAda() || UseAmpere()
+    temporal_interval_trace::SetEnabled(gpu_dispatch::UsesNativeProgram() || UseAmpere()
         || control.intervalLogging);
     const uint64_t revision = gDesiredRevision.fetch_add(1, std::memory_order_release) + 1;
     gControlReady.store(true, std::memory_order_release);
@@ -2170,8 +2188,10 @@ dlssg_preset_switch::Unavailable PresetSwitchUnavailableReason(uint32_t requeste
 {
     using Unavailable = dlssg_preset_switch::Unavailable;
     if (optiscaler_host::UiDelegated()) return Unavailable::eOptiScaler;
-    if (!gpu_dispatch::IsAda() && !UseAmpere()) return Unavailable::eGpu;
-    if (UseAmpere()) return Unavailable::eLegacyPreset;
+    if (!LivePresetGpu()) return Unavailable::eGpu;
+    // RTX 30/20 (V1.6.1): only a provider with the sole original preset stays
+    // restart-only; a modern one switches through its adopted reader below.
+    if (UseAmpere() && ampere_backend::LegacySinglePreset()) return Unavailable::eLegacyPreset;
     const auto api = static_cast<NgxGraphicsApi>(gActiveNgxGraphicsApi.load(std::memory_order_acquire));
     // The lifetime tracker covers the runtime D3D12 route only.
     if (api != NgxGraphicsApi::eUnknown && api != NgxGraphicsApi::eD3D12) return Unavailable::eGraphicsApi;
@@ -4184,6 +4204,9 @@ sl::Result SubmitAdjustedOptions(
         }, hasState, expectedLiveFeature);
 }
 
+sl::Result PassPublicSet(ControlRouteRecord& route, const sl::ViewportHandle& viewport,
+    const sl::DLSSGOptions& options) noexcept;
+
 // Live DLSS-G preset switching (V1.6.0), on the game's own Streamline calls and
 // under gStreamlineCallMutex. With submit, this call sends the forced Off and
 // the game's options afterwards itself (GetState). Without it, the game's
@@ -4219,14 +4242,15 @@ void AdvancePresetSwitch(const sl::ViewportHandle& viewport, bool submit)
             return;
         // As the game's own call: Streamline creates a new feature, whose
         // EndpointCore::Create reads the latched preset. Without a ready control
-        // route, pass the game's options as PassPublicSet does on RTX 40 (a live
-        // switch is never supported on RTX 30: eLegacyPreset).
+        // route, pass the game's options as PassPublicSet does (RTX 30/20: its
+        // fixed translated-route options).
         sl::Result result = sl::Result::eErrorNotInitialized;
         if (BridgeReady())
             result = SubmitAdjustedOptions(*route, viewport, source, ReadControlSnapshot(), false);
         else
         {
-            result = CallRouteSetOptions(*route, viewport, source);
+            result = UseAmpere() ? PassPublicSet(*route, viewport, source)
+                : CallRouteSetOptions(*route, viewport, source);
             gLastSetOptionsResult.store(static_cast<int32_t>(result), std::memory_order_relaxed);
             RecordSetOptionsLifecycle(*route, viewport, source.mode != sl::DLSSGMode::eOff, result);
         }
@@ -4625,9 +4649,9 @@ bool ResolveMidpointProvider(NgxDispatchRoute route, NgxGraphicsApi api,
     }
 
     // The runtime's own dispatch table names the provider NGX bound to Frame Generation. RTX 30 always
-    // used it; RTX 40 needs it when a game's own DLSS-G and an NVIDIA app override copy are both loaded
-    // (both fully covered: the unique-candidate fallback below must not choose between them).
-    if ((UseAmpere() || gpu_dispatch::IsAda()) && api == NgxGraphicsApi::eD3D12)
+    // used it; RTX 40 and RTX 50 need it when a game's own DLSS-G and an NVIDIA app override copy are both
+    // loaded (both fully covered: the unique-candidate fallback below must not choose between them).
+    if ((UseAmpere() || gpu_dispatch::UsesNativeProgram()) && api == NgxGraphicsApi::eD3D12)
     {
         const auto create = detour.kind == entry_detour::Kind::eNgxRuntimeD3D12CreateFeature
             ? detour : entry_detour::ReadSnapshot(entry_detour::Kind::eNgxRuntimeD3D12CreateFeature, detour.owner);
@@ -4831,7 +4855,7 @@ void BeforeNgxCreateFeatureForRoute(NgxDispatchRoute route,
             device->Release();
         }
     }
-    if (gpu_dispatch::IsAda())
+    if (NativeDlssgPresetGpu())
     {
         dlssg_preset::Prepare();
         InspectLoadedModule(provider, path);
@@ -5444,7 +5468,7 @@ void WINAPI BeforeNgxVulkanInit(void*, uintptr_t, const void*,
     gVulkanAdapterVerified.store(verified, std::memory_order_release);
     if (verified)
     {
-        if (gpu_dispatch::IsAda()) dlssg_preset::Prepare();
+        if (NativeDlssgPresetGpu()) dlssg_preset::Prepare();
         // As slSetD3DDevice does: the real-frame readout needs the interval trace.
         temporal_interval_trace::SetEnabled(true);
         // The base Init names its VkDevice (fifth argument).
@@ -5466,7 +5490,7 @@ void WINAPI BeforeNgxVulkanProjectInit(void*, uintptr_t, const void*,
     gVulkanAdapterVerified.store(verified, std::memory_order_release);
     if (verified)
     {
-        if (gpu_dispatch::IsAda()) dlssg_preset::Prepare();
+        if (NativeDlssgPresetGpu()) dlssg_preset::Prepare();
         temporal_interval_trace::SetEnabled(true);
         gModuleInventoryDirty.store(true, std::memory_order_release);
         InspectAlreadyLoadedModules();
@@ -6762,8 +6786,9 @@ sl::Result HookSlSetD3DDevice(void* device)
     if (verifiedDevice)
     {
         gModuleInventoryDirty.store(true, std::memory_order_release);
-        if (gpu_dispatch::IsAda())
+        if (NativeDlssgPresetGpu())
         {
+            // RTX 40 and RTX 50: re-inspect the plug-ins recorded before the family was known.
             dlssg_preset::Prepare();
             temporal_interval_trace::SetEnabled(true);
             InspectAlreadyLoadedModules();
@@ -6832,10 +6857,11 @@ sl::Result HookOptiScalerSlSetD3DDevice(void* device)
     const uint64_t call = gOptiScalerSlSetD3DDeviceCalls.fetch_add(1,
         std::memory_order_relaxed) + 1;
     // RTX 30 declares its architecture at startup and keeps its own route.
+    // RTX 40 patches its plug-ins here; RTX 50 only records them.
     const bool ampere = ampere_provider_arch::Armed() || UseAmpere();
-    const bool ada = !ampere && gpu_dispatch::ObserveAdaD3D12Device(device);
+    const bool native = !ampere && gpu_dispatch::ObserveNativeD3D12Device(device);
     bool inventoried = false;
-    if (ada)
+    if (native)
     {
         // Its slInit loaded the plug-ins on this thread just before; discovery
         // may not have recorded them yet. Toolhelp can fail while another
@@ -6847,8 +6873,9 @@ sl::Result HookOptiScalerSlSetD3DDevice(void* device)
         }
         PatchRecordedCandidates();
     }
-    Log(L"OptiScaler private Streamline slSetD3DDevice: call=%llu ada=%d ampere=%d inventory=%d "
-        L"(before its plug-in startup)", static_cast<unsigned long long>(call), ada, ampere, inventoried);
+    Log(L"OptiScaler private Streamline slSetD3DDevice: call=%llu ada=%d ampere=%d inventory=%d rtx50=%d "
+        L"(before its plug-in startup)", static_cast<unsigned long long>(call), native && gpu_dispatch::IsAda(),
+        ampere, inventoried, native && gpu_dispatch::IsBlackwell());
     if (!ampere)
         return original(device);
 
@@ -6931,7 +6958,7 @@ sl::Result HookSlSetVulkanInfo(const VulkanInfoPrefix& info)
     gVulkanAdapterVerified.store(verified, std::memory_order_release);
     if (verified)
     {
-        if (gpu_dispatch::IsAda()) dlssg_preset::Prepare();
+        if (NativeDlssgPresetGpu()) dlssg_preset::Prepare();
         temporal_interval_trace::SetEnabled(true);
         if (UseAmpere()) ampere_backend::ObserveVulkanDevice(device, true);
         gModuleInventoryDirty.store(true, std::memory_order_release);
@@ -7474,6 +7501,7 @@ sl::Result HookSlInit(const sl::Preferences& preferences,
         && static_cast<uint32_t>(OtaGpu::eAda) == static_cast<uint32_t>(gpu_dispatch::Family::eAda)
         && static_cast<uint32_t>(OtaGpu::eAmpere) == static_cast<uint32_t>(gpu_dispatch::Family::eAmpere)
         && static_cast<uint32_t>(OtaGpu::eTuring) == static_cast<uint32_t>(gpu_dispatch::Family::eTuring)
+        && static_cast<uint32_t>(OtaGpu::eBlackwell) == static_cast<uint32_t>(gpu_dispatch::Family::eBlackwell)
         && static_cast<uint32_t>(OtaGpu::eConflict) == static_cast<uint32_t>(gpu_dispatch::Family::eConflict));
     const auto earlyHardware = ampere_provider_arch::Read();
     const OtaGpu inventoryGpu = streamline_ota_policy::InventoryGpu(earlyHardware.detected,
@@ -7898,7 +7926,7 @@ FARPROC WINAPI HookMainGetProcAddress(HMODULE module, LPCSTR functionName)
     if (resolved && reinterpret_cast<uintptr_t>(functionName) > 0xFFFFu
         && ngx_initialization::IsEntry(functionName))
         InspectLoadedModule(module, LoadedModulePath(module));
-    if (resolved && gpu_dispatch::IsAda()) dlssg_preset::PrepareForExport(module, functionName);
+    if (resolved && NativeDlssgPresetGpu()) dlssg_preset::PrepareForExport(module, functionName);
     if (resolved) single_overlay::application_imports::ArmModule(module);
     resolved = single_overlay::ResolveProc(module, functionName, resolved);
     if (!resolved || !functionName
@@ -8103,7 +8131,7 @@ FARPROC WINAPI HookSlCommonGetProcAddress(
     if (resolved && reinterpret_cast<uintptr_t>(functionName) > 0xFFFFu
         && ngx_initialization::IsEntry(functionName))
         InspectLoadedModule(module, LoadedModulePath(module));
-    if (resolved && gpu_dispatch::IsAda()) dlssg_preset::PrepareForExport(module, functionName);
+    if (resolved && NativeDlssgPresetGpu()) dlssg_preset::PrepareForExport(module, functionName);
     if (!resolved || !functionName
         || reinterpret_cast<uintptr_t>(functionName) <= 0xFFFFu)
         return resolved;
@@ -8359,6 +8387,19 @@ PatternPatchResult PatchNgxMfgGate(HMODULE module, const std::wstring& path)
     return {result.candidate, result.patched, result.match};
 }
 
+// A provider's count/index gate on the selected GPU. RTX 40 restores it; RTX
+// 50 accepts multi-frame counts natively, so its supported provider is only
+// identified and counts as ready with nothing written.
+PatternPatchResult InspectNgxMfgGate(HMODULE module, const std::wstring& path)
+{
+    if (gpu_dispatch::IsBlackwell())
+    {
+        const bool supported = dlssg_provider_policy::IsSupportedRetainedProvider(module);
+        return {supported, supported, nullptr};
+    }
+    return gpu_dispatch::IsAda() ? PatchNgxMfgGate(module, path) : PatternPatchResult{true, false, nullptr};
+}
+
 // The RTX 30 legacy-wrapper (2x) audit runs on the selected Ampere adapter, or
 // before adapter selection when NVAPI found an RTX 30 GPU. Ada and systems
 // without an RTX 30 GPU keep beta.7's wrapper handling.
@@ -8583,8 +8624,11 @@ PatternPatchResult PatchUniqueWrapperMaximumPattern(
         if (AmpereWrapperAuditApplies() && ampere_wrapper::Discover(module, audited)
             && audited.maximumGeneratedFrames == 1)
             return {true, UseAmpere(), nullptr, 1};
-        return {true, UseAmpere() && memcmp(match + universal_wrapper_profile::kPatchOffset,
-            kWrapperOriginal.data(), kWrapperOriginal.size()) == 0, match, compiledMaximum};
+        // RTX 30 and RTX 50 keep the wrapper's own clamp: RTX 30 declares its
+        // architecture, and RTX 50's provider reports its real maximum.
+        return {true, (UseAmpere() || gpu_dispatch::IsBlackwell())
+            && memcmp(match + universal_wrapper_profile::kPatchOffset,
+                kWrapperOriginal.data(), kWrapperOriginal.size()) == 0, match, compiledMaximum};
     }
     uint8_t* address = match + universal_wrapper_profile::kPatchOffset;
     if (memcmp(address, kWrapperReplacement.data(),
@@ -8718,7 +8762,7 @@ void PrepareNgxInitialization(void* device, const entry_detour::Snapshot& entry,
     // when NGX initializes it.
     if (entry.current && device && gpu_dispatch::Selected() != gpu_dispatch::Family::eConflict)
         dlss_sr::PrepareForDevice(static_cast<ID3D12Device*>(device));
-    if (gpu_dispatch::IsAda() || gpu_dispatch::Selected() == gpu_dispatch::Family::eConflict) return;
+    if (gpu_dispatch::UsesNativeProgram() || gpu_dispatch::Selected() == gpu_dispatch::Family::eConflict) return;
     const auto ticket = ngx_initialization::PreparationTicket();
     if (!firstInit || !ticket || !entry.current || !device
         || ModuleGeneration(entry.owner) != entry.generation
@@ -8736,6 +8780,9 @@ void PrepareNgxInitialization(void* device, const entry_detour::Snapshot& entry,
             gAmpereNativeInitTicket = ticket;
             LogAmpereArchitectureDetection(ampere_provider_arch::DetectAndArm());
             PrepareAmpereProviderSelection();
+            // RTX 30/20 now has its family: the SR/RR DRS hook, still before
+            // NVIDIA's Init reads those keys.
+            dlss_sr::PrepareForDevice(static_cast<ID3D12Device*>(device));
             gModuleInventoryDirty.store(true, std::memory_order_release);
             InspectAlreadyLoadedModules();
         }
@@ -9028,9 +9075,9 @@ ModuleRecord InspectLoadedModule(HMODULE module, const std::wstring& suppliedPat
                 }
                 RecomputeModuleStateLocked();
             }
-            if (gpu_dispatch::IsAda() && existing->ngxExport && !existing->ngxPatched)
+            if (gpu_dispatch::UsesNativeProgram() && existing->ngxExport && !existing->ngxPatched)
             {
-                const auto result = PatchNgxMfgGate(module, path);
+                const auto result = InspectNgxMfgGate(module, path);
                 existing->ngxCandidate = result.candidate;
                 existing->ngxPatched = result.patched;
                 RecomputeModuleStateLocked();
@@ -9105,9 +9152,7 @@ ModuleRecord InspectLoadedModule(HMODULE module, const std::wstring& suppliedPat
             }
             if (record.ngxExport)
             {
-                const PatternPatchResult result = gpu_dispatch::IsAda()
-                    ? PatchNgxMfgGate(module, path)
-                    : PatternPatchResult{true, false, nullptr};
+                const PatternPatchResult result = InspectNgxMfgGate(module, path);
                 record.ngxCandidate = result.candidate;
                 record.ngxPatched = result.patched;
             }
@@ -9171,7 +9216,7 @@ ModuleRecord InspectLoadedModule(HMODULE module, const std::wstring& suppliedPat
             snapshot.module, snapshot.path, snapshot.generation);
         TryInstallNgxVulkanAdapterEntryDetours(
             snapshot.module, snapshot.path, snapshot.generation);
-        if (gpu_dispatch::IsAda()) dlssg_preset::ObserveProvider(snapshot.module, snapshot.generation);
+        if (NativeDlssgPresetGpu()) dlssg_preset::ObserveProvider(snapshot.module, snapshot.generation);
         if (logInventory)
         {
             const auto preset = dlssg_preset::ReadSnapshot(snapshot.module);
@@ -9627,7 +9672,7 @@ DWORD WINAPI PatchWorker(void* context)
     LogAmpereArchitectureDetection(ampere_provider_arch::DetectAndArm());
     Log(L"Diagnostics reused per executable: log=%s status=%s processBirth=%llu executable=%s",
         logPath.c_str(),gStatusPath.c_str(),static_cast<unsigned long long>(diagnostic_paths::ProcessBirth()),executablePath.c_str());
-    Log(L"RTXMFG build=1.6.0 source=v1.5-flipmeter-20261006 base=intel6.6+optiscaler.1+ring2.3+dltb.2+slhost.1+flipmeter.18+hairdiscovery.1.4.2+reflexfg.2+capture.2+optixell.1+optiout.1+optipace.1+model2x.1+mvfill.1+uioff.1+uistable.1+mfgport.1+hudmatch.1+optiport.1+optcapture.1+optiportdefault.1+xefgdiscovery.1+slrestart.1+nvapipin.1+modeltoggle.1+uirefresh.1+noport.1+optiredirect.1+reflexport.1+portback.1+optionly.1+delayload.1+rtx30.3+xellungated.1+specialk.1a+themidaimports.1+modelchoice.1+xefgmodel.1+splat.2+scenechange.1+xellinput.1+rtx30sl2732.1+mfgunlocker.1+presetc.3+rtx30presetc.1+rtx30stable.1+rtx30ota.1+cudawrapped.2+l10n.7+pin.4+turing.1+sm120.1+unet.1+nvlist.1+rtx30nvapi.1+rtx30buffers.1+gpuname.1+arcnative.3+rtx30flip.2+cudaowner.1+dredtable.1+optidlssg.1+xefgflipmeter.2+releaseleak.1+flipkey.1+cap6.1+optirtx30.1+livepreset.2+routegen.1+hitch.1+xefg134.1+rtx30vulkan.1+vkholes.1+vkvsync.1+vkfps.1+srpreset.1+srpreset.2+srpreset.3+srpreset.4+seam.1+scene.1+logpath.1+rtx20dlssg.1+slinitloop.1+lean160.1+xefgrace.1+latency.1 outputPullMask=%d occupancyHint=%d "
+    Log(L"RTXMFG build=1.6.1 source=v1.5-flipmeter-20261006 base=intel6.6+optiscaler.1+ring2.3+dltb.2+slhost.1+flipmeter.18+hairdiscovery.1.4.2+reflexfg.2+capture.2+optixell.1+optiout.1+optipace.1+model2x.1+mvfill.1+uioff.1+uistable.1+mfgport.1+hudmatch.1+optiport.1+optcapture.1+optiportdefault.1+xefgdiscovery.1+slrestart.1+nvapipin.1+modeltoggle.1+uirefresh.1+noport.1+optiredirect.1+reflexport.1+portback.1+optionly.1+delayload.1+rtx30.3+xellungated.1+specialk.1a+themidaimports.1+modelchoice.1+xefgmodel.1+splat.2+scenechange.1+xellinput.1+rtx30sl2732.1+mfgunlocker.1+presetc.3+rtx30presetc.1+rtx30stable.1+rtx30ota.1+cudawrapped.2+l10n.7+pin.4+turing.1+sm120.1+unet.1+nvlist.1+rtx30nvapi.1+rtx30buffers.1+gpuname.1+arcnative.3+rtx30flip.2+cudaowner.1+dredtable.1+optidlssg.1+xefgflipmeter.2+releaseleak.1+flipkey.1+cap6.1+optirtx30.1+livepreset.2+routegen.1+hitch.1+xefg134.1+rtx30vulkan.1+vkholes.1+vkvsync.1+vkfps.1+srpreset.1+srpreset.2+srpreset.3+srpreset.4+seam.1+scene.1+logpath.1+rtx20dlssg.1+slinitloop.1+lean160.1+xefgrace.1+latency.1+livepresetall.1+rtx50.1+slinitfg.1+slinitfg.2+psorefused.1 outputPullMask=%d occupancyHint=%d "
         L"uiInputs=framed-observations uiRecomposition=game-managed",
         MFG_UNLOCK_OUTPUT_PULL_MASK_ONLY,
         MFG_UNLOCK_OUTPUT_PULL_MASK_OCCUPANCY);
@@ -9777,7 +9822,7 @@ DWORD WINAPI PatchWorker(void* context)
                 if (mfgChanged)
                     StoreControl(activeControl);
                 else
-                    temporal_interval_trace::SetEnabled(gpu_dispatch::IsAda() || UseAmpere()
+                    temporal_interval_trace::SetEnabled(gpu_dispatch::UsesNativeProgram() || UseAmpere()
                         || activeControl.intervalLogging);
                 PublishLiveBridge(activeControl);
                 WriteBridgeStatus(activeControl, pid);
@@ -9949,7 +9994,7 @@ extern "C" BOOL WINAPI MfgUnlockCoreEntry(HINSTANCE instance, DWORD reason, LPVO
         dlss_sr::SetInitialSelectionLoader(&ReadInitialDlssSrPreset);
         dlss_sr::SetInitialRrSelectionLoader(&ReadInitialDlssRrPreset);
         dlss_sr::SetDrsHookInstaller(&InstallDlssSrDrsHook);
-        dlss_sr::SetRuntimeEligibilityProbe(&gpu_dispatch::IsAda);
+        dlss_sr::SetRuntimeEligibilityProbe(&LivePresetGpu);
         dlssg_preset::SetSettingFilter(dlss_sr::kDrsPresetSetting, &dlss_sr::FilterDrsRead);
         dlssg_preset::SetSettingFilter(dlss_sr::kDrsRrPresetSetting, &dlss_sr::FilterDrsRead);
         if (HMODULE interposer = GetModuleHandleW(L"sl.interposer.dll"))

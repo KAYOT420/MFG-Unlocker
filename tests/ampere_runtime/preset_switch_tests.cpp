@@ -324,6 +324,132 @@ void ConfigurationCases()
     gReads = {};
 }
 
+// V1.6.1: the RTX 30/20 translated route owns the provider's preset reader
+// with its own detour; dlssg_preset adopts that exact entry for the reset.
+void RouteOwnedCases()
+{
+    using namespace dlssg_preset;
+    const HMODULE module = GetModuleHandleW(nullptr);
+    void* const reader = reinterpret_cast<void*>(&FixtureEvaluate);
+    entry_detour::Handle hook{3, 9};
+    auto& route = entry_detour::testHandleHook;
+    route = {};
+    route.current = true;
+    route.kind = entry_detour::Kind::eAmperePreset;
+    route.owner = module;
+    route.target = reader;
+    route.generation = 11;
+    entry_detour::testHandle = hook;
+    Check(!AdoptRouteReader(nullptr, reader, 11, hook) && !AdoptRouteReader(module, nullptr, 11, hook)
+        && !AdoptRouteReader(module, reader, 0, hook) && !AdoptRouteReader(module, reader, 11, {}),
+        "adoption needs a module, reader, generation and an exact entry");
+    const auto refused = [&](auto change, const char* text) {
+        const auto saved = route;
+        change(route);
+        Check(!AdoptRouteReader(module, reader, 11, hook) && !gCachedReaders[0].module.load(), text);
+        route = saved;
+    };
+    refused([](auto& r) { r.current = false; }, "a route reader hook that is not current is not adopted");
+    refused([](auto& r) { r.kind = entry_detour::Kind::eDlssgCachedPresetRead; }, "only the translated route's preset entry is adopted");
+    refused([&](auto& r) { r.owner = reinterpret_cast<HMODULE>(0x7000000); }, "an entry of another module is not adopted");
+    refused([&](auto& r) { r.target = reinterpret_cast<void*>(&FixtureCreate); }, "an entry at another reader is not adopted");
+    refused([](auto& r) { r.generation = 12; }, "an entry of another generation is not adopted");
+    // This test executable is no DLSS-G provider: its layout stays unknown.
+    Check(!AdoptRouteReader(module, reader, 11, hook) && !ProviderSupportsLiveSwitch(module),
+        "an unknown configuration layout stays restart-only");
+    auto snapshot = ReadSnapshot(module);
+    Check(snapshot.cachedReaderInstalled && snapshot.cachedReaderFailure == 5 && !snapshot.configurationResetAvailable,
+        "the route's current reader is reported, with the unknown layout");
+    Check(!AdoptRouteReader(module, reader, 11, hook), "a repeated adoption keeps the unknown layout");
+
+    // The same reader with a discovered layout (as ConfigurationCases).
+    gReads = {};
+    gSelection = {};
+    SetRequested(kPresetB);
+    configuration = std::make_shared<FixtureConfiguration>();
+    auto& entry = gCachedReaders[0];
+    config::Layout layout{};
+    layout.module = module;
+    layout.slot = reinterpret_cast<void* volatile*>(&configuration);
+    provider_image::SafeRead(reinterpret_cast<uintptr_t>(layout.slot[1]), layout.controlVtable);
+    layout.create.begin = reinterpret_cast<uintptr_t>(&FixtureCreate);
+    layout.evaluate.begin = reinterpret_cast<uintptr_t>(&FixtureEvaluate);
+    layout.configurationReturn = 0x5000;
+    layout.report = {0x6000, 0x6100};
+    entry.config = layout;
+    entry.configReady.store(true);
+    entry.resets.store(0);
+    entry_detour::testOwner = module;
+    for (auto kind : {entry_detour::Kind::eDlssgEndpointCreate, entry_detour::Kind::eDlssgEndpointEvaluate})
+    {
+        auto& endpoint = entry_detour::testHooks[static_cast<size_t>(kind)];
+        endpoint = {};
+        endpoint.current = true;
+        endpoint.generation = 11;
+        endpoint.target = kind == entry_detour::Kind::eDlssgEndpointCreate
+            ? reinterpret_cast<void*>(&FixtureCreate) : reinterpret_cast<void*>(&FixtureEvaluate);
+        endpoint.original = endpoint.target;
+    }
+    Check(ProviderSupportsLiveSwitch(module) && ReadSnapshot(module).configurationResetAvailable,
+        "the adopted route reader plus both endpoint gates admit live switching");
+    {
+        const auto saved = route;
+        route.current = false;
+        auto& aggregate = entry_detour::testHooks[static_cast<size_t>(entry_detour::Kind::eDlssgCachedPresetRead)];
+        aggregate = saved;
+        aggregate.kind = entry_detour::Kind::eDlssgCachedPresetRead;
+        Check(!ProviderSupportsLiveSwitch(module),
+            "a lost route entry refuses live switching even with another reader hook present");
+        aggregate = {};
+        route = saved;
+        route.kind = entry_detour::Kind::eDlssgCachedPresetRead;
+        Check(!ProviderSupportsLiveSwitch(module), "the exact entry must stay the translated route's preset hook");
+        route = saved;
+        route.generation = 12;
+        Check(!ProviderSupportsLiveSwitch(module), "a route entry of a new generation refuses live switching");
+        route = saved;
+    }
+    RecordRouteRead(module, reinterpret_cast<void*>(0x5000), true, kPresetB, true);
+    RecordRouteRead(module, reinterpret_cast<void*>(0x6040), true, kPresetB, true);
+    RecordRouteRead(module, reinterpret_cast<void*>(0x7000), true, kPresetA, true);
+    snapshot = ReadSnapshot(module);
+    Check(snapshot.observedPresetValid && snapshot.observedPreset == kPresetB && snapshot.configurationReads == 1
+        && snapshot.reportReads == 1 && snapshot.providerReads == 3,
+        "route reads are classified by caller; only the configuration read is evidence");
+    Check(FreezeSelection() == kPresetB && SetRequested(kPresetC) && ReadSelection().restartRequired,
+        "a request after the route's first read is saved");
+    SetCreateQuiescenceProbe(&TrackerQuiescent);
+    gTracker.Created(0, 0xdef);
+    Check(!RelatchPending(), "a live feature on the translated route prevents the reset");
+    gTracker.Released(0, 0xdef);
+    const auto before = destroyed;
+    Check(RelatchPending() && !configuration && ReadSnapshot(module).configurationResets == 1
+        && !ReadSnapshot(module).observedPresetValid,
+        "an exact release resets the translated route's configuration");
+    configuration = std::make_shared<FixtureConfiguration>();
+    configuration->preset = FreezeSelection();
+    RecordRouteRead(module, reinterpret_cast<void*>(0x5000), true, configuration->preset, true);
+    Check(configuration->preset == kPresetC && destroyed == before + 1 && ReadSnapshot(module).observedPreset == kPresetC,
+        "the next Create reads the new preset through the route reader");
+
+    const HMODULE other = reinterpret_cast<HMODULE>(0x7200000);
+    RecordRouteRead(other, reinterpret_cast<void*>(0x5000), true, kPresetA, true);
+    Check(ReadSnapshot(other).providerReads == 1 && !ReadSnapshot(other).observedPresetValid,
+        "a route provider without an adopted reader records an unclassified read");
+    Check(!ReadProvidersSupportLiveSwitch(), "that provider keeps every provider restart-only");
+
+    gResetDenied.store(false); // Test isolation only; production denial is process-sticky.
+    configuration.reset();
+    entry.configReady.store(false);
+    entry.routeOwned = false;
+    entry.routeHook = {};
+    entry.module.store(nullptr);
+    entry_detour::testOwner = nullptr;
+    entry_detour::testHandle = {};
+    route = {};
+    gReads = {};
+}
+
 // A Create's reads all see one value, and a live feature keeps it, while
 // another thread keeps saving and latching new presets.
 void ConcurrencyCases()
@@ -410,6 +536,7 @@ int main()
     LatchCases();
     ReplayCases();
     ConfigurationCases();
+    RouteOwnedCases();
     ConcurrencyCases();
     std::cout << "PRESET_SWITCH checks=" << checks << " failures=" << failures << '\n';
     return failures ? 1 : 0;

@@ -58,10 +58,13 @@ inline uint32_t Vendor(const State& state) noexcept
 // turned on this session (lastActive). Before the game has turned either on,
 // XeSS shows on non-NVIDIA GPUs, in games offering only XeSS, and on NVIDIA
 // GPUs the DLSS backend checked and found without DLSS MFG (gpuFamily 1 Ada,
-// 2 Ampere experimental); DLSS shows otherwise.
+// 2 Ampere, 4 Turing RTX, 5 Blackwell RTX); DLSS shows otherwise.
 enum class Section { Dlss, Xess };
 constexpr uint32_t kNvidiaVendor = 0x10de;
-inline bool DlssMfgFamily(uint32_t gpuFamily) noexcept { return gpuFamily == 1 || gpuFamily == 2 || gpuFamily == 4; }
+inline bool DlssMfgFamily(uint32_t gpuFamily) noexcept
+{
+    return gpuFamily == 1 || gpuFamily == 2 || gpuFamily == 4 || gpuFamily == 5;
+}
 inline Section SettingsSection(const State& state, const std::string& lastActive, bool dlssOffered,
     uint32_t gpuFamily) noexcept
 {

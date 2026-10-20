@@ -7,9 +7,11 @@
 #include "adapter_discovery.h"
 #include "ampere_host_contracts.h"
 #include "ampere_policy.h"
+#include "ampere_startup_requirements.h"
 #include "ampere_flip_metering.h"
 #include "ampere_vulkan_output.h"
 #include "dlssg_provider_policy.h"
+#include "dlssg_provider_selection.h"
 #include "dlssg_preset.h"
 #include "dlss_sr.h"
 #include "fg_lifetime_tracker.h"
@@ -124,6 +126,10 @@ std::atomic<uint64_t> gCandidateProviderVersion{0};
 // V1.6.0 live preset switching: FG lifetime on the runtime route.
 fg_lifetime::Tracker<> gFgLifetime;
 ampere_diagnostics::Failures gFailures;
+// FG requirement queries during slInit/startup on an RTX 30/20 system. The
+// first few are logged: Streamline keeps or drops sl.dlss_g on this answer.
+constexpr uint32_t kStartupRequirementReports = 8;
+std::atomic<uint32_t> gStartupRequirementQueries{0}, gInitRequirementQueries{0};
 thread_local unsigned gStartupDepth = 0;
 thread_local unsigned gPreparationDepth = 0;
 std::atomic<PreparationBoundaryResolver> gPreparationBoundaryResolver{nullptr};
@@ -1130,7 +1136,9 @@ template<size_t I> __declspec(noinline) bool Preset(uint32_t setting, uint32_t* 
         result = original(setting, value);
         if (result ? !AccessPresetValue(value, observed, false) : !WritablePresetValue(value)) return result;
     }
-    dlssg_preset::RecordProviderRead(provider, result, result ? observed : 0, overridden);
+    // Classified by caller (configuration or report read) once the route's
+    // reader is adopted for live switching (AdoptLivePresetReader).
+    dlssg_preset::RecordRouteRead(provider, caller, result, result ? observed : 0, overridden);
     gPresetQueries.fetch_add(1, std::memory_order_relaxed);
     return result;
 }
@@ -1165,9 +1173,11 @@ template<size_t I> NVSDK_NGX_Result NVSDK_CONV Create(ID3D12GraphicsCommandList*
     {
         if (!original) return NVSDK_NGX_Result_FAIL_NotInitialized;
         if (frameGeneration && gpu_dispatch::Selected() == gpu_dispatch::Family::eConflict) return kRejected;
-        if (frameGeneration || gpu_dispatch::IsAda())
+        // RTX 50 takes RTX 40's pass-through: its pre-call selects the provider
+        // and records the controls' evidence, but publishes no patch there.
+        if (frameGeneration || gpu_dispatch::UsesNativeProgram())
         {
-            const auto before = frameGeneration && gpu_dispatch::IsAda() ? gRoutes[I].beforeCreate : nullptr;
+            const auto before = frameGeneration && gpu_dispatch::UsesNativeProgram() ? gRoutes[I].beforeCreate : nullptr;
             const auto entry = gRoutes[I].create;
             lock.unlock();
             if (before) before(command, static_cast<uintptr_t>(feature), parameters, output,
@@ -1372,7 +1382,7 @@ template<size_t I> NVSDK_NGX_Result NVSDK_CONV Evaluate(ID3D12GraphicsCommandLis
     if (!gpu_dispatch::UsesTranslatedProgram())
     {
         if (gpu_dispatch::Selected() == gpu_dispatch::Family::eConflict) return kRejected;
-        const auto before = gpu_dispatch::IsAda() ? gRoutes[I].beforeEvaluate : nullptr;
+        const auto before = gpu_dispatch::UsesNativeProgram() ? gRoutes[I].beforeEvaluate : nullptr;
         const auto entry = gRoutes[I].evaluate;
         const bool runtime = gRoutes[I].runtime && dlss_sr::Active();
         const auto create = runtime ? RouteOriginal<CreateFn>(gRoutes[I], gRoutes[I].create) : nullptr;
@@ -1675,7 +1685,7 @@ bool WINAPI ProviderGate(void* arg1, uintptr_t arg2, const void* arg3, void* arg
         if (selectedEntry.kind == entry_detour::Kind::eNgxD3D12CreateFeature
             && arg2 == NVSDK_NGX_Feature_FrameGeneration)
             gFgLifetime.ObserveProviderCreate();
-        if (gpu_dispatch::IsAda())
+        if (gpu_dispatch::UsesNativeProgram())
         {
             if (selectedEntry.kind == entry_detour::Kind::eNgxD3D12CreateFeature
                 && arg2 == NVSDK_NGX_Feature_FrameGeneration && selectedRoute->beforeCreate)
@@ -1754,6 +1764,87 @@ bool WINAPI ProviderGate(void* arg1, uintptr_t arg2, const void* arg3, void* arg
     return Reject(166);
 }
 
+// The RTX 30/20 predicates of one FG requirements query during slInit/startup.
+struct StartupRequirementScope
+{
+    // native: RTX 40/50, whose provider runs its own program and needs no answer here.
+    bool native = false, conflict = false, adapter = false, fatal = false;
+    bool Scoped() const noexcept { return !native && !conflict && adapter && !fatal; }
+};
+
+template<typename AdapterCheck>
+StartupRequirementScope ObserveStartupRequirementScope(AdapterCheck&& adapterMatches) noexcept
+{
+    StartupRequirementScope scope{};
+    scope.native = gpu_dispatch::UsesNativeProgram();
+    scope.conflict = gpu_dispatch::Selected() == gpu_dispatch::Family::eConflict;
+    scope.adapter = !scope.native && !scope.conflict && adapterMatches();
+    scope.fatal = gFatal.load();
+    return scope;
+}
+
+// The patcher's pre-slInit OTA scan selected an NVIDIA-signed provider whose
+// embedded version this route admits. It is mapped and verified at device setup.
+bool EligibleOtaProviderSelected() noexcept
+{
+    const auto selection = dlssg_provider_selection::Read();
+    return selection.prepared && selection.selected && selection.selected.nvidiaSigned
+        && dlssg_provider_policy::IsSupportedAmpereVersion(selection.selected.version);
+}
+
+ampere_startup_requirements::Answer DecideStartupRequirements(NVSDK_NGX_Result result,
+    const NVSDK_NGX_FeatureRequirement& native) noexcept
+{
+    ampere_startup_requirements::Query query{};
+    query.success = result == NVSDK_NGX_Result_Success;
+    query.adapterAnswer = native.FeatureSupported == NVSDK_NGX_FeatureSupportResult_AdapterUnsupported
+        || native.FeatureSupported == NVSDK_NGX_FeatureSupportResult_Supported;
+    query.featureMissing = result == NVSDK_NGX_Result_FAIL_FeatureNotSupported
+        || result == NVSDK_NGX_Result_FAIL_FeatureNotFound;
+    query.providerReady = ampere_gpu::Ready();
+    query.slInit = gInitDepth != 0;
+    query.eligibleOta = query.featureMissing && !query.providerReady && query.slInit && EligibleOtaProviderSelected();
+    return ampere_startup_requirements::Decide(query);
+}
+
+NVSDK_NGX_Result AnswerStartupRequirements(NVSDK_NGX_Result result, NVSDK_NGX_FeatureRequirement* requirements,
+    ampere_startup_requirements::Answer answer) noexcept
+{
+    using ampere_startup_requirements::Answer;
+    if (answer == Answer::eAdapterSupported)
+    {
+        requirements->FeatureSupported = NVSDK_NGX_FeatureSupportResult_Supported;
+        requirements->MinHWArchitecture = 0;
+        return result;
+    }
+    if (answer == Answer::eReadyProvider || answer == Answer::eEligibleOta)
+    {
+        // Restrict the requirements override to this verified FG startup.
+        *requirements = {};
+        requirements->FeatureSupported = NVSDK_NGX_FeatureSupportResult_Supported;
+        return NVSDK_NGX_Result_Success;
+    }
+    return result;
+}
+
+// Streamline unloads sl.dlss_g during slInit when this answer is unsupported
+// on every adapter; the log line is the only record of that decision.
+void ReportStartupRequirements(const wchar_t* api, const StartupRequirementScope& scope, NVSDK_NGX_Result result,
+    const NVSDK_NGX_FeatureRequirement& native, ampere_startup_requirements::Answer answer) noexcept
+{
+    if (!scope.Scoped() && !ampere_provider_arch::Armed()) return;
+    if (gInitDepth) gInitRequirementQueries.fetch_add(1, std::memory_order_relaxed);
+    if (gStartupRequirementQueries.fetch_add(1, std::memory_order_relaxed) >= kStartupRequirementReports) return;
+    wchar_t detail[384]{};
+    swprintf_s(detail, L"Ampere FG requirements (%ls, %ls): result=0x%08X featureSupported=%d minArchitecture=0x%X "
+        L"scoped=%u native=%u conflict=%u adapter=%u fatal=%u providerReady=%u answer=%hs",
+        api, gInitDepth ? L"slInit" : L"startup", static_cast<uint32_t>(result), static_cast<int>(native.FeatureSupported),
+        native.MinHWArchitecture, static_cast<unsigned>(scope.Scoped()), static_cast<unsigned>(scope.native),
+        static_cast<unsigned>(scope.conflict), static_cast<unsigned>(scope.adapter), static_cast<unsigned>(scope.fatal),
+        static_cast<unsigned>(ampere_gpu::Ready()), ampere_startup_requirements::AnswerName(answer));
+    Report(detail);
+}
+
 template<size_t I> NVSDK_NGX_Result NVSDK_CONV Requirements(IDXGIAdapter* adapter,
     const NVSDK_NGX_FeatureDiscoveryInfo* discovery, NVSDK_NGX_FeatureRequirement* requirements)
 {
@@ -1763,39 +1854,29 @@ template<size_t I> NVSDK_NGX_Result NVSDK_CONV Requirements(IDXGIAdapter* adapte
     // Streamline asks this during slInit, before a D3D12 device exists.
     // Verify only the adapter supplied to this FG query. Actual device LUID
     // confirmation remains mandatory before program publication and Create.
-    const bool scoped =
-        !gpu_dispatch::IsAda() && gpu_dispatch::Selected() != gpu_dispatch::Family::eConflict &&
-        (gInitDepth || gStartupDepth) && requirements && discovery
-        && discovery->FeatureID == NVSDK_NGX_Feature_FrameGeneration
-        && ampere_gpu::ObserveAdapter(adapter) && !gFatal.load();
-    if (!scoped)
+    const bool startupQuery = (gInitDepth || gStartupDepth) && requirements && discovery
+        && discovery->FeatureID == NVSDK_NGX_Feature_FrameGeneration;
+    if (!startupQuery)
     {
         // Non-FG and ordinary capability discovery is pure pass-through. It
         // must not serialize native code with feature callbacks on gCalls.
         lock.unlock();
         return original(adapter, discovery, requirements);
     }
-    const auto result = original(adapter, discovery, requirements);
-    if (gFatal.load()) return result;
-    if (result == NVSDK_NGX_Result_Success
-        && (requirements->FeatureSupported == NVSDK_NGX_FeatureSupportResult_AdapterUnsupported
-            || requirements->FeatureSupported == NVSDK_NGX_FeatureSupportResult_Supported))
+    const auto scope = ObserveStartupRequirementScope([&] { return ampere_gpu::ObserveAdapter(adapter); });
+    if (!scope.Scoped())
     {
-        requirements->FeatureSupported = NVSDK_NGX_FeatureSupportResult_Supported;
-        requirements->MinHWArchitecture = 0;
+        lock.unlock();
+        const auto result = original(adapter, discovery, requirements);
+        ReportStartupRequirements(L"d3d12", scope, result, *requirements, ampere_startup_requirements::Answer::eNative);
         return result;
     }
-    if (ampere_gpu::Ready()
-        && (result == NVSDK_NGX_Result_FAIL_FeatureNotSupported || result == NVSDK_NGX_Result_FAIL_FeatureNotFound))
-    {
-        // The actual eligible provider and its full SM86 program are present.
-        // Restrict the requirements override to this verified FG startup.
-        *requirements = {};
-        requirements->FeatureSupported = NVSDK_NGX_FeatureSupportResult_Supported;
-        return NVSDK_NGX_Result_Success;
-    }
-    // Do not invent a feature when the provider is absent or failed to load.
-    return result;
+    const auto result = original(adapter, discovery, requirements);
+    const auto native = *requirements;
+    const auto answer = gFatal.load() ? ampere_startup_requirements::Answer::eNative
+        : DecideStartupRequirements(result, native);
+    ReportStartupRequirements(L"d3d12", scope, result, native, answer);
+    return AnswerStartupRequirements(result, requirements, answer);
 }
 
 bool PublishStartupCapabilities(Route& route, NVSDK_NGX_Parameter* parameters) noexcept
@@ -1811,6 +1892,19 @@ bool PublishStartupCapabilities(Route& route, NVSDK_NGX_Parameter* parameters) n
                 : candidate.wrapperLayout.maximumGeneratedFrames;
     if (!ampere_policy::CapacityValid(bootstrapMaximum))
     {
+        // No DLSS-G wrapper reached device setup at all: Streamline dropped
+        // sl.dlss_g during slInit (or never loaded it). An unrecognized
+        // wrapper layout is reported when it is inspected and stays 170.
+        if (std::none_of(gRoutes.begin(), gRoutes.end(),
+                [](const Route& candidate) { return candidate.wrapperInspected; }))
+        {
+            wchar_t detail[256]{};
+            swprintf_s(detail, L"Ampere capability bootstrap refused: no Streamline DLSS-G plug-in reached device setup; "
+                L"RTX 30/20 FG requirements queries this run=%u",
+                gStartupRequirementQueries.load(std::memory_order_relaxed));
+            Report(detail);
+            return Reject(ampere_diagnostics::kStartupWrapperMissingFailure);
+        }
         // Bounded startup evidence: distinguish an absent pacer from a late,
         // unreadable or already allocated wrapper if the rig still refuses.
         for (const auto& candidate : gRoutes)
@@ -2288,34 +2382,27 @@ template<size_t I> NVSDK_NGX_Result NVSDK_CONV VkRequirements(void* instance, vo
     // sl.common asks this during slInit with its own temporary instance. As
     // for D3D12, only the queried adapter is verified here; the device LUID is
     // still confirmed before program publication and Create.
-    const bool scoped =
-        !gpu_dispatch::IsAda() && gpu_dispatch::Selected() != gpu_dispatch::Family::eConflict &&
-        (gInitDepth || gStartupDepth) && requirements && discovery
-        && discovery->FeatureID == NVSDK_NGX_Feature_FrameGeneration
-        && ampere_gpu::ObserveVulkanAdapter(physicalDevice) && !gFatal.load();
-    if (!scoped)
+    const bool startupQuery = (gInitDepth || gStartupDepth) && requirements && discovery
+        && discovery->FeatureID == NVSDK_NGX_Feature_FrameGeneration;
+    if (!startupQuery)
     {
         lock.unlock();
         return original(instance, physicalDevice, discovery, requirements);
     }
-    const auto result = original(instance, physicalDevice, discovery, requirements);
-    if (gFatal.load()) return result;
-    if (result == NVSDK_NGX_Result_Success
-        && (requirements->FeatureSupported == NVSDK_NGX_FeatureSupportResult_AdapterUnsupported
-            || requirements->FeatureSupported == NVSDK_NGX_FeatureSupportResult_Supported))
+    const auto scope = ObserveStartupRequirementScope([&] { return ampere_gpu::ObserveVulkanAdapter(physicalDevice); });
+    if (!scope.Scoped())
     {
-        requirements->FeatureSupported = NVSDK_NGX_FeatureSupportResult_Supported;
-        requirements->MinHWArchitecture = 0;
+        lock.unlock();
+        const auto result = original(instance, physicalDevice, discovery, requirements);
+        ReportStartupRequirements(L"vulkan", scope, result, *requirements, ampere_startup_requirements::Answer::eNative);
         return result;
     }
-    if (ampere_gpu::Ready()
-        && (result == NVSDK_NGX_Result_FAIL_FeatureNotSupported || result == NVSDK_NGX_Result_FAIL_FeatureNotFound))
-    {
-        *requirements = {};
-        requirements->FeatureSupported = NVSDK_NGX_FeatureSupportResult_Supported;
-        return NVSDK_NGX_Result_Success;
-    }
-    return result;
+    const auto result = original(instance, physicalDevice, discovery, requirements);
+    const auto native = *requirements;
+    const auto answer = gFatal.load() ? ampere_startup_requirements::Answer::eNative
+        : DecideStartupRequirements(result, native);
+    ReportStartupRequirements(L"vulkan", scope, result, native, answer);
+    return AnswerStartupRequirements(result, requirements, answer);
 }
 
 template<size_t I> NVSDK_NGX_Result NVSDK_CONV VkParameters(NVSDK_NGX_Parameter** output)
@@ -2591,6 +2678,24 @@ bool InstallPreset(Route& route, const Image& image) noexcept
     { gFatal.store(true); return Reject(143); }
     Report(L"Ampere FG preset query hook installed; selection is fixed at the first query; driver profiles unchanged");
     return true;
+}
+
+// V1.6.1: live DLSS-G preset switching on a prepared route. Its own reader hook
+// stays the reader's only owner; dlssg_preset adds the endpoint gates and the
+// configuration reset. Legacy (sole preset 1) routes stay restart-only.
+void AdoptLivePresetReader(const Route& route) noexcept
+{
+    if (!route.preset || route.legacyPresetReady || route.runtime) return;
+    const auto reader = entry_detour::ReadSnapshot(route.preset);
+    const uint64_t start = GetTickCount64();
+    const bool adopted = reader.current && dlssg_preset::AdoptRouteReader(route.module, reader.target,
+        route.generation, route.preset);
+    wchar_t detail[224]{};
+    swprintf_s(detail, L"Ampere FG preset live switch: %ls (module=%p generation=%llu, %llu ms)",
+        adopted ? L"configuration reset available" : L"configuration not established; a new preset applies after a restart",
+        route.module, static_cast<unsigned long long>(route.generation),
+        static_cast<unsigned long long>(GetTickCount64() - start));
+    Report(detail);
 }
 
 uintptr_t DirectMaximumDeviceGate(const Image& image, unsigned& matches,
@@ -3099,7 +3204,7 @@ void SetPreparationBoundaryResolver(PreparationBoundaryResolver resolver) noexce
 { gPreparationBoundaryResolver.store(resolver, std::memory_order_release); }
 void BeginInit() noexcept
 {
-    ++gInitDepth;
+    if (++gInitDepth == 1) gInitRequirementQueries.store(0, std::memory_order_relaxed);
     // Unknown/Ada slInit is a native call and can wait on another thread's NGX
     // callbacks. Unknown Ampere requirement overrides acquire gCalls inside
     // Requirements/ObserveModule, covering each actual mutation and restore.
@@ -3119,6 +3224,10 @@ void EndInit() noexcept
     std::lock_guard lock(gCalls);
     for (auto& route : gRoutes)
         if (route.availability.active) route.availability.Set(false);
+    // Without a supported FG answer here, Streamline has already unloaded
+    // sl.dlss_g and the startup bootstrap will find no wrapper (177).
+    if (gInitDepth == 1 && ampere_provider_arch::Armed() && !gInitRequirementQueries.load(std::memory_order_relaxed))
+        Report(L"Ampere FG requirements: no FrameGeneration requirements query reached the NGX runtime hook during slInit");
     if (gInitLockDepth == gInitDepth)
     {
         gInitLockDepth = 0;
@@ -3296,6 +3405,7 @@ void ObserveModule(HMODULE module, const wchar_t* path, uint64_t generation,
         if (!route->deviceGateReady || !ampere_gpu::PatchProvider(module, path, boundary)) { Reject(151); return; }
         route->prepared = true;
         RetainLegacyPresetContract(index, *route);
+        AdoptLivePresetReader(*route);
     }
     if (runtime && !route->prepared && (gInitDepth || gStartupDepth || gPreparationDepth))
     {
@@ -3334,9 +3444,9 @@ bool InstallRoute(HMODULE module, const wchar_t* path, uint64_t generation, bool
     std::lock_guard callLock(gCalls);
     std::lock_guard lock(gInstall);
     if (!module || !generation) return false;
-    // Provider entry routes serve both GPUs: RTX 40 keeps the shared eligibility (310.9.16 included),
-    // RTX 30 its own (Ada-only builds excluded).
-    if (!runtime && !(gpu_dispatch::IsAda()
+    // Provider entry routes serve every GPU: RTX 40 and RTX 50 keep the shared eligibility (310.9.16
+    // included), RTX 30 its own (Ada-only builds excluded).
+    if (!runtime && !(gpu_dispatch::UsesNativeProgram()
             ? dlssg_provider_policy::IsSupportedProvider(module, path)
             : dlssg_provider_policy::IsSupportedAmpereProvider(module, path))) return false;
     auto* route = FindRoute(module, generation);
@@ -3345,9 +3455,9 @@ bool InstallRoute(HMODULE module, const wchar_t* path, uint64_t generation, bool
     // Prove the private driver layout before installing any mutating callback.
     // A native intermediary continues to the separately verified runtime. If
     // that runtime is absent, startup and provider admission still fail closed.
-    // Selected Ada callbacks are native pass-throughs and need no Ampere layout.
+    // Selected RTX 40 and RTX 50 callbacks are native pass-throughs and need no Ampere layout.
     if (runtime
-        && !gpu_dispatch::IsAda()
+        && !gpu_dispatch::UsesNativeProgram()
         )
     {
         Image image{};

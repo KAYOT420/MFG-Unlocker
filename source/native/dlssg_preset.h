@@ -1,6 +1,7 @@
 #pragma once
 
 #include "dlssg_preset_policy.h"
+#include "entry_detour.h"
 
 #include <Windows.h>
 #include <cstdint>
@@ -71,8 +72,22 @@ void SetCreateQuiescenceProbe(CreateQuiescenceProbe probe) noexcept;
 bool RelatchPending() noexcept;
 // The configuration singleton is structurally identified and every endpoint
 // Create/Evaluate plus the cached reader have current, generation-matched hooks.
-// RTX 30's separately hooked preset route does not establish this ownership.
 bool ProviderSupportsLiveSwitch(HMODULE provider) noexcept;
+// V1.6.1, RTX 30/20 translated route: that route's own detour (`readerHook`)
+// owns the provider's cached preset reader at `reader`. Discovers the endpoint
+// configuration and installs only the endpoint gates; live switching then also
+// requires `readerHook` to stay current with `generation` at `reader`. Call
+// before the provider's first Create. False leaves the provider restart-only.
+bool AdoptRouteReader(HMODULE module, void* reader, uint64_t generation,
+    entry_detour::Handle readerHook) noexcept;
+// A provider read through a route-owned reader, classified by its caller like
+// the reads of this module's own reader hook (configuration, report or other).
+void RecordRouteRead(HMODULE provider, const void* caller, bool valueValid, uint32_t value,
+    bool overridden) noexcept;
+// Translated route: its reader hook alone answers the FG preset key, so the
+// NvAPI hook leaves that key to the driver (legacy providers accept only their
+// original preset). Set before Prepare(); DRS setting filters are unaffected.
+void SetNvapiFrameGenerationReads(bool enabled) noexcept;
 // Before a Create selects a provider: every provider that has read the preset
 // supports live switching, and at least one has read it.
 bool ReadProvidersSupportLiveSwitch() noexcept;

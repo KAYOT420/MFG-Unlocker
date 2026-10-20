@@ -47,31 +47,41 @@ struct Layer
     uint16_t tileW, tileH;     // kernel tile (output positions)
     uint16_t gridZ;            // kernel grid z
     uint32_t constants;        // root constant words the program reads (mask)
+    // psorefused.1: the byte sizes of the program and of the own program (0: none). A program of any other size cannot
+    // have the layer's SHA-256, so the route hashes only these sizes, whoever creates the pipeline.
+    uint32_t bytes, ownBytes;
 };
 constexpr Layer kLayers[] = {
     {{"aa016078", "8c2efb9e955f39379a91887ed3d90412c4b7ae2c142a874e3da5f699de197f7c", "L_aa016078",
-        "ce847b58086ce7e9d25f7d8b90e989247cd4582226506d9552112f1ef4130643"}, 0, Family::Pool, 16, 16, 1, 8, 16, 1, 0},
-    {{"198d6bf8", "aac1354a8004fe0aae02947a372f622a84b8d61c1691fc77d7fddedaf74ad36b", "L_198d6bf8"}, 1, Family::Pool, 4, 16, 1, 8, 8, 1, 0},
-    {{"dcd8becf", "ba5c8b9ea1aa3aa3ce12acb4c2ff4c7c32d2bccab304c539246ad83f737523a0", "L_dcd8becf"}, 2, Family::Pool, 4, 8, 1, 8, 16, 2, 0},
+        "ce847b58086ce7e9d25f7d8b90e989247cd4582226506d9552112f1ef4130643"}, 0, Family::Pool, 16, 16, 1, 8, 16, 1, 0, 47728, 92932},
+    {{"198d6bf8", "aac1354a8004fe0aae02947a372f622a84b8d61c1691fc77d7fddedaf74ad36b", "L_198d6bf8"}, 1, Family::Pool, 4, 16, 1, 8, 8, 1, 0, 53304, 0},
+    {{"dcd8becf", "ba5c8b9ea1aa3aa3ce12acb4c2ff4c7c32d2bccab304c539246ad83f737523a0", "L_dcd8becf"}, 2, Family::Pool, 4, 8, 1, 8, 16, 2, 0, 54196, 0},
     {{"efbe3788", "40e159414d5b839ba7e0e07cbf8ff4ef425ee026c216b2928ef3bb6dd0e20d40", "L_efbe3788",
-        "efa8da5ef5f90c62b789b0fed8e77e2ce043e558d164cc552ca7fb9127cedb00"}, 3, Family::Pool, 8, 4, 1, 8, 8, 4, 0},
-    {{"50f0c205", "fea66ef764b267613725fd37be22dc279b23280ffa132e53c285a798ac27df5e", "L_50f0c205"}, 4, Family::Pool, 16, 16, 1, 16, 4, 4, 0},
-    {{"a3c3caa1", "51f5754a8f4dd34791351f2156f121c4cf119a5fae63bce76266a66b7a097d9a", "L_a3c3caa1"}, 5, Family::Pool, 16, 8, 1, 16, 8, 1, 0},
-    {{"9481d452", "8cffea0f51779e7ddea756043802e9635d6b853d6aee2176ffb1f25a605750c0", "L_9481d452"}, 6, Family::Pool, 8, 8, 1, 16, 16, 1, 0},
-    {{"06e97933", "3cdf1a4746fc91bf161f320e0256dbbccc954e774add6ac53caf50b7d1be69f7", "L_06e97933"}, 7, Family::Pool, 8, 8, 1, 16, 16, 1, 0},
+        "efa8da5ef5f90c62b789b0fed8e77e2ce043e558d164cc552ca7fb9127cedb00"}, 3, Family::Pool, 8, 4, 1, 8, 8, 4, 0, 54224, 54388},
+    {{"50f0c205", "fea66ef764b267613725fd37be22dc279b23280ffa132e53c285a798ac27df5e", "L_50f0c205"}, 4, Family::Pool, 16, 16, 1, 16, 4, 4, 0, 56256, 0},
+    {{"a3c3caa1", "51f5754a8f4dd34791351f2156f121c4cf119a5fae63bce76266a66b7a097d9a", "L_a3c3caa1"}, 5, Family::Pool, 16, 8, 1, 16, 8, 1, 0, 56280, 0},
+    {{"9481d452", "8cffea0f51779e7ddea756043802e9635d6b853d6aee2176ffb1f25a605750c0", "L_9481d452"}, 6, Family::Pool, 8, 8, 1, 16, 16, 1, 0, 28764, 0},
+    {{"06e97933", "3cdf1a4746fc91bf161f320e0256dbbccc954e774add6ac53caf50b7d1be69f7", "L_06e97933"}, 7, Family::Pool, 8, 8, 1, 16, 16, 1, 0, 35316, 0},
     {{"3ed03daf", "01c8beac27d3f3f82ecba8f3dc2d9d8b60d4c175a41df3c24a24e8643f5578f5", "L_3ed03daf",
-        "9900c30febf95bfa81b4da1178e5773863116beba4d3f032897da4254b6d8926"}, 8, Family::Decoder, 16, 32, 1, 16, 16, 1, 3},
+        "9900c30febf95bfa81b4da1178e5773863116beba4d3f032897da4254b6d8926"}, 8, Family::Decoder, 16, 32, 1, 16, 16, 1, 3, 35852, 37760},
     {{"748b0baf", "8291bbc36b1100b07d0788f35a3a9fadfbfcc2267ff0ccb7afb114d76f5d69fe", "L_748b0baf",
-        "e78063f97ad2c0913412f07589cd17d0f2a6ebeeb6edd70647a69cca6b6a02bf"}, 9, Family::Decoder, 8, 16, 1, 16, 8, 1, 3},
+        "e78063f97ad2c0913412f07589cd17d0f2a6ebeeb6edd70647a69cca6b6a02bf"}, 9, Family::Decoder, 8, 16, 1, 16, 8, 1, 3, 57376, 38104},
     {{"cb391582", "a60f7488872a675d66afd2bec02b0b89e3cc38c1c4ed1d25d745a7b2fe677412", "L_cb391582",
-        "7a29fbf311cd8dee5b8c1cfdadf31ee983092a512cf9c10845a079b457eb62a9"}, 10, Family::Decoder, 32, 8, 1, 16, 16, 1, 3},
-    {{"fc1b8a04", "8c1d7667722c8692b376ed7511723b5e58efd61d4a4b8c4b61a1233f75df76ee", "L_fc1b8a04"}, 11, Family::Flow, 8, 8, 28, 16, 8, 7, kFlowConstants},
-    {{"3459485", "51667b6d9955036a10cbd4e363881252de8ca5d3b6f210a7a3ee6cab719629a6", "L_3459485"}, 12, Family::Flow, 8, 8, 28, 16, 8, 7, kFlowConstants},
-    {{"3452733", "f4aa535a6fc74410ae8b684eb881b9fd511c6a1ac1c784cc95bd8f7fd8ea0f61", "L_3452733"}, 13, Family::Flow, 8, 8, 28, 16, 8, 7, kFlowConstants},
-    {{"55e5d6b9", "09887269759ef4d7588315f29e71126c899fde79f9edb336eedd598c662d4aea", "L_flow16_acc17"}, 14, Family::Flow, 8, 8, 4, 16, 8, 2, kFlowConstants},
-    {{"34517926", "1bebcab193714ee264da7dc0a96e313d74ad4c71017fdea5314c8b07f6b56394", "L_flow16_acc17"}, 14, Family::Flow, 8, 8, 4, 16, 8, 2, kFlowConstants},
-    {{"3453044", "13abff5d769ef56f99cb9ee7825968872e28395d77a6d344053c06cb08b8064c", "L_3453044"}, 15, Family::Flow, 8, 8, 4, 16, 8, 2, kFlowConstants},
+        "7a29fbf311cd8dee5b8c1cfdadf31ee983092a512cf9c10845a079b457eb62a9"}, 10, Family::Decoder, 32, 8, 1, 16, 16, 1, 3, 57372, 38124},
+    {{"fc1b8a04", "8c1d7667722c8692b376ed7511723b5e58efd61d4a4b8c4b61a1233f75df76ee", "L_fc1b8a04"}, 11, Family::Flow, 8, 8, 28, 16, 8, 7, kFlowConstants, 13704, 0},
+    {{"3459485", "51667b6d9955036a10cbd4e363881252de8ca5d3b6f210a7a3ee6cab719629a6", "L_3459485"}, 12, Family::Flow, 8, 8, 28, 16, 8, 7, kFlowConstants, 15948, 0},
+    {{"3452733", "f4aa535a6fc74410ae8b684eb881b9fd511c6a1ac1c784cc95bd8f7fd8ea0f61", "L_3452733"}, 13, Family::Flow, 8, 8, 28, 16, 8, 7, kFlowConstants, 15948, 0},
+    {{"55e5d6b9", "09887269759ef4d7588315f29e71126c899fde79f9edb336eedd598c662d4aea", "L_flow16_acc17"}, 14, Family::Flow, 8, 8, 4, 16, 8, 2, kFlowConstants, 23912, 0},
+    {{"34517926", "1bebcab193714ee264da7dc0a96e313d74ad4c71017fdea5314c8b07f6b56394", "L_flow16_acc17"}, 14, Family::Flow, 8, 8, 4, 16, 8, 2, kFlowConstants, 26164, 0},
+    {{"3453044", "13abff5d769ef56f99cb9ee7825968872e28395d77a6d344053c06cb08b8064c", "L_3453044"}, 15, Family::Flow, 8, 8, 4, 16, 8, 2, kFlowConstants, 26164, 0},
 };
+constexpr bool LayerSizes()
+{
+    for (const auto& layer : kLayers)
+        if (!layer.bytes || bool(layer.ownBytes) != bool(layer.info.ownSha256)) return false;
+    return true;
+}
+static_assert(LayerSizes(), "every program has a size, and every own program (only those) has one");
 constexpr std::array<LayerInfo, std::size(kLayers)> MakeInfos()
 {
     std::array<LayerInfo, std::size(kLayers)> out{};
@@ -813,7 +823,8 @@ bool FromWrapper(const void* address) noexcept
 
 // A runtime device call the provider made. Directly (caller in its image), or through the wrapper of the device it
 // holds: the wrapper's image calls the runtime, and the first frame outside that image is the provider's. Anything
-// else the wrapper forwards (the game's calls, the wrapper's own objects) is passed through.
+// else the wrapper forwards (the game's calls, the wrapper's own objects) is passed through. The provider's lists are
+// adopted only on this rule; pipeline states also on the provider's frame further up (OriginOf).
 bool ProviderCall(const void* caller) noexcept
 {
     if (FromProvider(caller)) return true;
@@ -824,6 +835,65 @@ bool ProviderCall(const void* caller) noexcept
     while (i < count && !FromWrapper(frames[i])) ++i;  // this module's frames, up to the wrapper's call
     while (i < count && FromWrapper(frames[i])) ++i;   // the wrapper's frames
     return i < count && FromProvider(frames[i]);
+}
+
+// psorefused.1 (board #543): where a pipeline state call came from. A module that hooks pipeline creation between the
+// provider and the wrapper (or the runtime) is the first frame after the wrapper's: the SCSKiller shader recorder's
+// d3d12.dll under ReShade (CONTROL Resonant, 16 Oct) and a dxgi.dll setup in Keeper (20 Oct) kept every layer on the
+// DXIL port that way, with the provider's lists adopted (that recorder does not hook list creation). A layer pipeline is
+// therefore also recognized when the provider's image is a frame of this bounded walk above that module; lists keep
+// ProviderCall, so a launch still needs a list the provider created itself.
+struct Origin
+{
+    const void* first{};  // the first frame after the wrapper's frames (the hook's caller when that is not the wrapper's)
+    bool strict{};        // ProviderCall's rule: the caller, or after the wrapper's frames the first frame, is the provider's
+    int provider{-1};     // frames from first up to the provider's first frame; -1: none within the walk
+    USHORT frames{};      // frames walked
+};
+std::atomic<bool> gStackRecognition{true};
+Origin OriginOf(const void* caller) noexcept
+{
+    Origin origin{caller};
+    if (FromProvider(caller)) { origin.strict = true; origin.provider = 0; return origin; }
+    std::array<void*, 32> frames{};
+    origin.frames = RtlCaptureStackBackTrace(0, USHORT(frames.size()), frames.data(), nullptr);
+    size_t i = 0;
+    while (i < origin.frames && frames[i] != caller) ++i;      // this module's frames, up to the hook's return address
+    while (i < origin.frames && FromWrapper(frames[i])) ++i;  // the wrapper's frames
+    if (i >= origin.frames) return origin;                    // the hook's caller not found, or nothing above the wrapper
+    origin.first = frames[i];
+    origin.strict = FromWrapper(caller) && FromProvider(frames[i]);
+    for (size_t j = i; j < origin.frames; ++j)
+        if (FromProvider(frames[j])) { origin.provider = int(j - i); break; }
+    return origin;
+}
+bool Accepted(const Origin& origin) noexcept
+{
+    return origin.strict || (origin.provider >= 0 && gStackRecognition.load(std::memory_order_relaxed));
+}
+std::string OriginFields(const void* caller, const Origin& origin)
+{
+    return "\"caller\":\"" + Where(caller) + "\",\"first\":\"" + Where(origin.first) + "\",\"provider_frame\":" +
+        std::to_string(origin.provider) + ",\"frames\":" + std::to_string(origin.frames);
+}
+
+// psorefused.1: a pipeline state the route did not recognize although its program is a layer's (caller: the provider is
+// not within the walk; device: another device than the route's), or the provider created it as a stream the route does
+// not parse. Each reason is logged once (a stream once per subobject type, four lines at most), so a tester log names
+// the module or the stream shape in the way. Logging only: recognition does not depend on it.
+enum PsoRefusal : uint32_t { kPsoCaller = 1, kPsoDevice = 2 };
+std::atomic<uint32_t> gPsoRefusals{};
+std::atomic<uint64_t> gPsoStreamKinds{};
+std::atomic<uint32_t> gPsoStreamLines{};
+void LayerRefused(PsoRefusal reason, const char* text, const Layer& layer, const void* caller, const Origin* known = nullptr) noexcept
+{
+    if (gPsoRefusals.fetch_or(reason) & reason) return;
+    try
+    {
+        Log("cuda_pso_refused", std::string("\"reason\":\"") + text + "\",\"program\":\"" + layer.info.program + "\"," +
+            OriginFields(caller, known ? *known : OriginOf(caller)));
+    }
+    catch (...) {}
 }
 
 // The open list CreateCommandList returns (recording into allocator from initial), made as
@@ -880,23 +950,35 @@ HRESULT STDMETHODCALLTYPE HookCreateCommandList1(ID3D12Device4* self, UINT mask,
     return result;
 }
 
-void Recognize(ID3D12Device* device, const D3D12_COMPUTE_PIPELINE_STATE_DESC& desc, REFIID iid, void* created) noexcept
+// A pipeline state whose program is a layer's, on the route's device, created by the provider (OriginOf). Only a program
+// of a layer's exact size is hashed (psorefused.1): every module's compute pipelines reach this, and only the provider's
+// count.
+void Recognize(ID3D12Device* device, const D3D12_COMPUTE_PIPELINE_STATE_DESC& desc, REFIID iid, void* created, const void* caller) noexcept
 {
     try
     {
-        if (!desc.CS.pShaderBytecode || desc.CS.BytecodeLength < 32 || desc.CS.BytecodeLength > 1000000) return;
-        ComPtr<IUnknown> identity;
-        if (FAILED(device->QueryInterface(IID_PPV_ARGS(&identity))) || identity.Get() != gDeviceIdentity) return;
+        const SIZE_T length = desc.CS.BytecodeLength;
+        if (!desc.CS.pShaderBytecode || length < 32 || length > 1000000
+            || std::none_of(std::begin(kLayers), std::end(kLayers), [length](const Layer& layer) { return length == layer.bytes || length == layer.ownBytes; }))
+            return;
         sha256_util::Digest digest{};
-        if (!sha256_util::Compute(desc.CS.pShaderBytecode, desc.CS.BytecodeLength, digest)) return;
+        if (!sha256_util::Compute(desc.CS.pShaderBytecode, length, digest)) return;
         const auto hash = sha256_util::LowerHex(digest);
         for (size_t i = 0; i < std::size(kLayers); ++i)
         {
             const bool own = kLayers[i].info.ownSha256 && hash == kLayers[i].info.ownSha256;
             if (hash != kLayers[i].info.sha256 && !own) continue;
+            ComPtr<IUnknown> identity;
+            if (FAILED(device->QueryInterface(IID_PPV_ARGS(&identity))) || identity.Get() != gDeviceIdentity)
+            { LayerRefused(kPsoDevice, "device", kLayers[i], caller); return; }
+            const Origin origin = OriginOf(caller);
+            if (!Accepted(origin)) { LayerRefused(kPsoCaller, "caller", kLayers[i], caller, &origin); return; }
             ComPtr<ID3D12PipelineState> state;
             if (FAILED(static_cast<IUnknown*>(created)->QueryInterface(IID_PPV_ARGS(&state)))) return;
             if (iid != __uuidof(ID3D12PipelineState) && state.Get() != created) return; // keyed by the pointer bound later
+            // Recognized above the provider's first frame: the layer's line names the module in between.
+            const std::string stack = origin.strict ? std::string() : ",\"origin\":\"stack\",\"first\":\"" + Where(origin.first) +
+                "\",\"provider_frame\":" + std::to_string(origin.provider);
             std::lock_guard lock(gMutex);
             if (!gActive.load(std::memory_order_relaxed) || !Insert(state.Get(), uint8_t(i + 1))) return;
             gHeld.push_back(state.Detach());
@@ -904,7 +986,7 @@ void Recognize(ID3D12Device* device, const D3D12_COMPUTE_PIPELINE_STATE_DESC& de
             gLayerCount.store(uint32_t(gHeld.size()), std::memory_order_relaxed);
             if (!gLayerSeen[i].exchange(true))
                 Log("cuda_layer", std::string("\"program\":\"") + kLayers[i].info.program + "\",\"kernel\":\"" +
-                    kLayers[i].info.kernel + "\"" + (own ? ",\"source\":\"rtxmfg\"" : ""));
+                    kLayers[i].info.kernel + "\"" + (own ? ",\"source\":\"rtxmfg\"" : "") + stack);
             return;
         }
     }
@@ -915,8 +997,8 @@ HRESULT STDMETHODCALLTYPE HookCreateComputePipelineState(ID3D12Device* self, con
 {
     void* caller = _ReturnAddress();
     const HRESULT result = DeviceOriginal<CreateComputeFn>(self, kCreateComputePipelineState)(self, desc, iid, out);
-    if (SUCCEEDED(result) && desc && out && *out && gActive.load(std::memory_order_acquire) && ProviderCall(caller))
-        Recognize(self, *desc, iid, *out);
+    if (SUCCEEDED(result) && desc && out && *out && gActive.load(std::memory_order_acquire))
+        Recognize(self, *desc, iid, *out, caller);
     return result;
 }
 
@@ -931,19 +1013,24 @@ template <class Inner> constexpr size_t SubobjectSize()
     constexpr size_t align = (std::max)(alignof(Inner), alignof(void*));
     return (InnerOffset<Inner>() + sizeof(Inner) + align - 1)/align*align;
 }
-// The stream's compute shader; null for a stream with any other shader, or a subobject not listed here.
-const D3D12_SHADER_BYTECODE* StreamComputeShader(const D3D12_PIPELINE_STATE_STREAM_DESC& desc) noexcept
+// Where a stream's parse ended without a compute shader (psorefused.1 log).
+struct StreamStop { const char* reason{}; UINT type{}; size_t offset{}; };
+// The stream's compute shader; null for a stream with any other shader, or a subobject not listed here. A stream with
+// another subobject (even default graphics state a wrapper might add) stays unrecognized: that the runtime ignores it
+// in a compute pipeline is not established here, so such a stream is only logged.
+const D3D12_SHADER_BYTECODE* StreamComputeShader(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, StreamStop& stop) noexcept
 {
     const auto* stream = static_cast<const unsigned char*>(desc.pPipelineStateSubobjectStream);
-    if (!stream || reinterpret_cast<uintptr_t>(stream) % alignof(void*)) return nullptr;
+    if (!stream || reinterpret_cast<uintptr_t>(stream) % alignof(void*)) { stop.reason = "stream_alignment"; return nullptr; }
     const D3D12_SHADER_BYTECODE* compute{};
     for (size_t at = 0; at + sizeof(UINT) <= desc.SizeInBytes;)
     {
         size_t size{};
-        switch (*reinterpret_cast<const UINT*>(stream + at))
+        const UINT type = *reinterpret_cast<const UINT*>(stream + at);
+        switch (type)
         {
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS:
-            if (at + SubobjectSize<D3D12_SHADER_BYTECODE>() > desc.SizeInBytes) return nullptr;
+            if (at + SubobjectSize<D3D12_SHADER_BYTECODE>() > desc.SizeInBytes) { stop = {"stream_truncated", type, at}; return nullptr; }
             compute = reinterpret_cast<const D3D12_SHADER_BYTECODE*>(stream + at + InnerOffset<D3D12_SHADER_BYTECODE>());
             size = SubobjectSize<D3D12_SHADER_BYTECODE>();
             break;
@@ -951,11 +1038,32 @@ const D3D12_SHADER_BYTECODE* StreamComputeShader(const D3D12_PIPELINE_STATE_STRE
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK: size = SubobjectSize<UINT>(); break;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO: size = SubobjectSize<D3D12_CACHED_PIPELINE_STATE>(); break;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS: size = SubobjectSize<D3D12_PIPELINE_STATE_FLAGS>(); break;
-        default: return nullptr; // another shader stage, graphics state, or unknown: not a provider compute program
+        default: stop = {"stream_subobject", type, at}; return nullptr; // another shader stage, graphics state, or unknown
         }
         at += size;
     }
+    if (!compute) stop.reason = "stream_no_compute_shader";
     return compute;
+}
+
+// psorefused.1: a stream the provider created (either origin rule) that the parse refused: once per subobject type or
+// reason, four lines at most. Once those are logged, refused streams are not walked.
+void StreamRefused(const StreamStop& stop, const void* caller) noexcept
+{
+    if (!stop.reason) return;
+    const bool subobject = !strcmp(stop.reason, "stream_subobject"), truncated = !strcmp(stop.reason, "stream_truncated");
+    const uint64_t kind = 1ull << (subobject ? (std::min)(stop.type, 60u) : truncated ? 61 : !strcmp(stop.reason, "stream_alignment") ? 62 : 63);
+    if (gPsoStreamLines.load(std::memory_order_relaxed) >= 4 || (gPsoStreamKinds.load(std::memory_order_relaxed) & kind)) return;
+    const Origin origin = OriginOf(caller);
+    if (!origin.strict && origin.provider < 0) return;
+    if ((gPsoStreamKinds.fetch_or(kind) & kind) || gPsoStreamLines.fetch_add(1) >= 4) return;
+    try
+    {
+        Log("cuda_pso_refused", std::string("\"reason\":\"") + stop.reason + "\"" + (subobject || truncated
+            ? ",\"subobject_type\":" + std::to_string(stop.type) + ",\"offset\":" + std::to_string(stop.offset) : std::string()) +
+            "," + OriginFields(caller, origin));
+    }
+    catch (...) {}
 }
 
 using CreateStreamFn = HRESULT (STDMETHODCALLTYPE*)(ID3D12Device2*, const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**);
@@ -963,13 +1071,18 @@ HRESULT STDMETHODCALLTYPE HookCreatePipelineState(ID3D12Device2* self, const D3D
 {
     void* caller = _ReturnAddress();
     const HRESULT result = DeviceOriginal<CreateStreamFn>(self, kCreatePipelineState)(self, desc, iid, out);
-    if (SUCCEEDED(result) && desc && out && *out && gActive.load(std::memory_order_acquire) && ProviderCall(caller))
-        if (const D3D12_SHADER_BYTECODE* shader = StreamComputeShader(*desc))
+    if (SUCCEEDED(result) && desc && out && *out && gActive.load(std::memory_order_acquire))
+    {
+        StreamStop stop;
+        if (const D3D12_SHADER_BYTECODE* shader = StreamComputeShader(*desc, stop))
         {
             D3D12_COMPUTE_PIPELINE_STATE_DESC compute{};
             compute.CS = *shader;
-            Recognize(self, compute, iid, *out);
+            Recognize(self, compute, iid, *out, caller);
         }
+        else if (FromProvider(caller) || FromWrapper(caller)) // not walked for the game's own pipelines on the runtime's device
+            StreamRefused(stop, caller);
+    }
     return result;
 }
 
@@ -1041,6 +1154,8 @@ void MarkUnavailable(const std::string& reason)
 }
 
 void SetLog(LogFunction log) noexcept { gLog = log; }
+
+void SetStackRecognition(bool enabled) noexcept { gStackRecognition.store(enabled, std::memory_order_relaxed); }
 
 bool Install(ID3D12Device* device, HMODULE providerModule, std::span<const unsigned char> fatbin, std::string& reason) noexcept
 {

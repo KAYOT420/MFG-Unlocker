@@ -1,10 +1,9 @@
-# Building v1.6.0
+# Building v1.6.1
 
-The v1.6.0 release combines the DLSS MFG backend, the built-in menu with its
-translations, RTX 30 and experimental RTX 20 support, and XeSS Multi Frame
+The v1.6.1 release combines the DLSS MFG backend, the built-in menu with its
+translations, RTX 50, RTX 30 and experimental RTX 20 support, and XeSS Multi Frame
 Generation (XeMFG) through OptiScaler, including the XeMFG tensor-core kernels,
-in one DLL. It includes the v1.5.0-hotfix.1 VRAM leak
-fix. ProductVersion is 1.6.0; FileVersion is 1.6.0.1004.
+in one DLL. ProductVersion is 1.6.1; FileVersion is 1.6.1.1021.
 
 The release target is `RTXMFGUnified`, producing `Release/MFGUnlocker.dll`.
 Use Windows x64, Visual Studio 2022/MSVC 14.38.33130, Windows SDK
@@ -60,7 +59,7 @@ actual paths and a fresh build directory:
     -NativeCacheRoot 'C:/BuildInputs/rtxmfg-sm86' `
     -XessSdkRoot 'C:/SDKs/xess-sdk-3.0.2' `
     -XessProgramsRoot 'C:/BuildInputs/xess-programs' `
-    -BuildDirectory "$PWD/build/v1.6.0" `
+    -BuildDirectory "$PWD/build/v1.6.1" `
     -EnableNgxCreateResultDiagnostics
 ```
 
@@ -110,6 +109,12 @@ Test projects:
   real System32 `dxgi.dll` inside its own process only. Its
   flip-metering, wrapper, selection and architecture tests take real
   `sl.dlss_g.dll` wrappers and DLSS-G providers as arguments.
+- `tests/blackwell_runtime`: RTX 50 identification and menu policy. Its CTest
+  runs the selection, Vulkan admission, Streamline OTA, menu family and Dynamic
+  MFG checks, which need no inputs, and the adapter probe, which runs the
+  production RTX 50 check against the machine's NVIDIA adapters through the
+  installed driver's CUDA (exit 2 without one). RTX 50 runs DLSS-G unmodified,
+  so nothing here maps or patches a provider.
 - `tests/xess_cuda`: the XeMFG tensor-core route against Intel's DXIL programs,
   through the production route code, on an NVIDIA RTX 20/30/40/50 GPU. Every layer
   program, padded and poisoned outputs, fuzzed and shrunken constants, and the

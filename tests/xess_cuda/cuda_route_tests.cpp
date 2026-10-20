@@ -21,6 +21,7 @@
 //
 //   XefgCudaRouteTests --fatbin FILE --programs DIR [--programs DIR ...]
 //       [--list create|create1] [--expect-agility] [--wrapped-device] [--expect-wrapper] [--dred] [--expect-class-table]
+//       [--recorder [--stream] [--strict]] [--wrapper-stream-subobject]
 // --dred (cudaowner.1, board #431): DRED auto-breadcrumbs and page-fault reporting forced on before the device is
 // created, as Wuthering Waves runs (board #430). An Agility runtime then keeps each list on its class table in the
 // runtime's image; --expect-class-table (dredtable.1, board #432) requires that runtime beside the executable, the
@@ -32,6 +33,14 @@
 // must be refused, for the whole process. --expect-wrapper: ReShade's dxgi.dll beside the executable wraps the
 // device, lists and heaps (as in a game with ReShade); the route must resolve the runtime's device and hook the
 // runtime's lists under the wrappers, and every case must still pass.
+// --recorder (psorefused.1, board #543): the routed pipelines are created on a device wrapper (XefgPsoWrapper.dll's, or
+// ReShade's with --expect-wrapper) whose pipeline methods XefgPsoRecorder.dll hooks, as the SCSKiller shader recorder's
+// d3d12.dll hooks ReShade's: provider -> recorder -> wrapper -> runtime, with the lists created as before. Every layer
+// must be recognized above the recorder (cuda_layer origin "stack") and every case must pass. --stream: the routed
+// pipelines are CreatePipelineState streams. --strict: the route's stack recognition off (the caller rule before
+// psorefused.1): no layer may be recognized, the one cuda_pso_refused line must name the recorder as the first frame
+// after the wrapper's, and a routed Dispatch must keep Intel's program. --wrapper-stream-subobject: XefgPsoWrapper.dll
+// passes compute pipelines on as streams with a default SAMPLE_MASK subobject: not recognized, logged once with its type.
 // DIR: DXIL programs (any file names); each layer's program (and own program) is found by its SHA-256.
 #include <windows.h>
 #include <d3d12.h>
@@ -540,6 +549,89 @@ int ArchitectureGate()
     printf("%zu cases, %zu failures\n", std::size(cases), failures);
     return failures ? 1 : 0;
 }
+
+// ---- psorefused.1: pipelines through a recorder module and a device wrapper (tests/xess_cuda/pso_*.cpp) ------------------
+struct PsoModules
+{
+    HRESULT (*wrap)(ID3D12Device*, BOOL, ID3D12Device**){};
+    BOOL (*record)(ID3D12Device*){};
+    LONG (*recorded)(){};
+};
+PsoModules LoadPsoModules()
+{
+    wchar_t exe[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    const auto directory = fs::path(exe).parent_path();
+    const HMODULE wrapper = LoadLibraryW((directory / L"XefgPsoWrapper.dll").c_str());
+    const HMODULE recorder = LoadLibraryW((directory / L"XefgPsoRecorder.dll").c_str());
+    if (!wrapper || !recorder) throw std::runtime_error("XefgPsoWrapper.dll and XefgPsoRecorder.dll must be beside the executable");
+    PsoModules modules;
+    modules.wrap = reinterpret_cast<decltype(modules.wrap)>(GetProcAddress(wrapper, "XefgWrapDevice"));
+    modules.record = reinterpret_cast<decltype(modules.record)>(GetProcAddress(recorder, "XefgRecordPipelines"));
+    modules.recorded = reinterpret_cast<decltype(modules.recorded)>(GetProcAddress(recorder, "XefgRecordedPipelines"));
+    if (!modules.wrap || !modules.record || !modules.recorded) throw std::runtime_error("XefgPso module exports");
+    return modules;
+}
+// A routed pipeline as the provider creates it on the device it holds: CreateComputePipelineState, or (--stream) a
+// CreatePipelineState stream of its root signature and compute shader.
+ComPtr<ID3D12PipelineState> CreateRouted(ID3D12Device* device, ID3D12RootSignature* root, const std::vector<uint8_t>& dxil, bool stream)
+{
+    ComPtr<ID3D12PipelineState> pso;
+    if (!stream)
+    {
+        D3D12_COMPUTE_PIPELINE_STATE_DESC d{}; d.pRootSignature = root; d.CS = {dxil.data(), dxil.size()};
+        Check(device->CreateComputePipelineState(&d, IID_PPV_ARGS(&pso)), "routed pso");
+        return pso;
+    }
+    struct alignas(void*) Root { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type; ID3D12RootSignature* root; };
+    struct alignas(void*) Shader { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type; D3D12_SHADER_BYTECODE cs; };
+    struct { Root root; Shader cs; } subobjects{{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root},
+        {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS, {dxil.data(), dxil.size()}}};
+    const D3D12_PIPELINE_STATE_STREAM_DESC desc{sizeof(subobjects), &subobjects};
+    ComPtr<ID3D12Device2> device2; Check(device->QueryInterface(IID_PPV_ARGS(&device2)), "device2");
+    Check(device2->CreatePipelineState(&desc, IID_PPV_ARGS(&pso)), "routed stream pso");
+    return pso;
+}
+// The route's log lines of one stage.
+std::vector<std::string> RouteLines(const char* stage)
+{
+    std::vector<std::string> lines;
+    const std::string prefix = std::string(stage) + " {";
+    for (size_t at = 0; at < gRouteLog.size();)
+    {
+        const size_t end = gRouteLog.find('\n', at);
+        const std::string line = gRouteLog.substr(at, end == std::string::npos ? std::string::npos : end - at);
+        if (!line.compare(0, prefix.size(), prefix)) lines.push_back(line);
+        if (end == std::string::npos) break;
+        at = end + 1;
+    }
+    return lines;
+}
+// --strict / --wrapper-stream-subobject: no routed pipeline is recognized, one cuda_pso_refused line carries expected,
+// and a routed Dispatch keeps Intel's program (no launch).
+int RefusedTest(Gpu& g, Program& program, bool create1, const std::vector<std::string>& expected)
+{
+    const auto status = xefg_cuda::Snapshot();
+    const auto refusals = RouteLines("cuda_pso_refused");
+    bool named = refusals.size() == 1;
+    for (const auto& text : expected) named = named && refusals[0].find(text) != std::string::npos;
+    const bool unrecognized = status.layers == 0 && RouteLines("cuda_layer").empty();
+    printf("%s refused: %u recognized pipeline states, %zu cuda_pso_refused line(s)%s\n", unrecognized && named ? "PASS" : "FAIL",
+        status.layers, refusals.size(), named ? " naming what is in the way" : "");
+    g.MakeList(create1);
+    const Spec& s = kSpecs[0];
+    const Case c = Make(s, 37, 29, 5, true, 0);
+    const auto reference = Run(g, s, c, program, program.reference.Get(), false);
+    const auto before = xefg_cuda::Snapshot();
+    const auto routed = Run(g, s, c, program, program.routed.Get(), false);
+    const auto after = xefg_cuda::Snapshot();
+    size_t poison{};
+    const size_t bad = Mismatches(reference, routed, poison);
+    const bool kept = bad == 0 && after.launches == before.launches;
+    printf("%s %s routed Dispatch keeps Intel's program: %zu mismatching words, launches +%llu\n", kept ? "PASS" : "FAIL", s.name, bad,
+        (unsigned long long)(after.launches - before.launches));
+    return unrecognized && named && kept ? 0 : 1;
+}
 }
 
 int main(int argc, char** argv)
@@ -549,6 +641,7 @@ int main(int argc, char** argv)
         if (argc == 2 && !strcmp(argv[1], "--architecture-gate")) return ArchitectureGate();
         fs::path fatbinPath; std::vector<fs::path> programDirs;
         bool create1 = false, expectAgility = false, wrappedDevice = false, expectWrapper = false, dred = false, expectClassTable = false;
+        bool recorder = false, stream = false, strict = false, wrapperStreamSubobject = false;
         for (int i = 1; i < argc; ++i)
         {
             if (!strcmp(argv[i], "--fatbin") && i + 1 < argc) fatbinPath = argv[++i];
@@ -564,9 +657,15 @@ int main(int argc, char** argv)
             else if (!strcmp(argv[i], "--expect-wrapper")) expectWrapper = true;
             else if (!strcmp(argv[i], "--dred")) dred = true;
             else if (!strcmp(argv[i], "--expect-class-table")) expectClassTable = true;
+            else if (!strcmp(argv[i], "--recorder")) recorder = true;
+            else if (!strcmp(argv[i], "--stream")) stream = true;
+            else if (!strcmp(argv[i], "--strict")) strict = true;
+            else if (!strcmp(argv[i], "--wrapper-stream-subobject")) wrapperStreamSubobject = true;
             else throw std::runtime_error(std::string("unknown argument ") + argv[i]);
         }
         if (fatbinPath.empty() || programDirs.empty()) throw std::runtime_error("usage: --fatbin FILE --programs DIR [...]");
+        if ((stream || strict) && !recorder) throw std::runtime_error("--stream and --strict need --recorder");
+        if (wrapperStreamSubobject && (recorder || expectWrapper)) throw std::runtime_error("--wrapper-stream-subobject runs alone");
         const auto fatbin = ReadFile(fatbinPath);
         std::map<std::string, std::vector<uint8_t>> bySha;
         for (const auto& dir : programDirs)
@@ -635,25 +734,64 @@ int main(int argc, char** argv)
             }
             programs[info.program] = std::move(p);
         }
+        // psorefused.1: the device the provider holds and creates its pipelines on. --recorder / --wrapper-stream-subobject:
+        // XefgPsoWrapper.dll's wrapper of the runtime's device (ReShade's own device with --expect-wrapper), and under
+        // --recorder XefgPsoRecorder.dll hooks its pipeline methods. The lists are created on g.device as before.
+        ComPtr<ID3D12Device> provided = g.device;
+        PsoModules modules{};
+        const bool psoModules = recorder || wrapperStreamSubobject;
+        if (psoModules)
+        {
+            modules = LoadPsoModules();
+            if (!expectWrapper)
+            {
+                ID3D12Device* wrapper{};
+                Check(modules.wrap(g.device.Get(), wrapperStreamSubobject, &wrapper), "XefgWrapDevice");
+                provided.Attach(wrapper);
+            }
+            if (recorder && !modules.record(provided.Get())) throw std::runtime_error("XefgRecordPipelines");
+            printf("pipelines: %s%ls\n", recorder ? "XefgPsoRecorder.dll -> " : "", ImageName(TableOf(provided.Get())).c_str());
+        }
+        if (strict) xefg_cuda::SetStackRecognition(false);
         std::string reason;
-        if (!xefg_cuda::Install(g.device.Get(), GetModuleHandleW(nullptr), {fatbin.data(), fatbin.size()}, reason))
+        if (!xefg_cuda::Install(provided.Get(), GetModuleHandleW(nullptr), {fatbin.data(), fatbin.size()}, reason))
             throw std::runtime_error("route unavailable: " + reason);
-        if (expectWrapper && gRouteLog.find("\"native\":\"unwrap\"") == std::string::npos && gRouteLog.find("\"native\":\"fence\"") == std::string::npos)
-            throw std::runtime_error("--expect-wrapper: the route did not resolve the runtime's device under the wrapper");
+        if ((expectWrapper || psoModules) && gRouteLog.find("\"native\":\"unwrap\"") == std::string::npos
+            && gRouteLog.find("\"native\":\"fence\"") == std::string::npos)
+            throw std::runtime_error("the route did not resolve the runtime's device under the wrapper");
         for (auto& [name, p] : programs)
         {
-            D3D12_COMPUTE_PIPELINE_STATE_DESC d{}; d.pRootSignature = p.root.Get(); d.CS = {p.dxil.data(), p.dxil.size()};
-            Check(g.device->CreateComputePipelineState(&d, IID_PPV_ARGS(&p.routed)), "routed pso");
-            if (!p.own.empty())
-            {
-                D3D12_COMPUTE_PIPELINE_STATE_DESC o{}; o.pRootSignature = p.root.Get(); o.CS = {p.own.data(), p.own.size()};
-                Check(g.device->CreateComputePipelineState(&o, IID_PPV_ARGS(&p.ownRouted)), "own routed pso");
-            }
+            p.routed = CreateRouted(provided.Get(), p.root.Get(), p.dxil, stream);
+            if (!p.own.empty()) p.ownRouted = CreateRouted(provided.Get(), p.root.Get(), p.own, stream);
         }
         const auto status0 = xefg_cuda::Snapshot();
         printf("route active, compute capability %d.%d, %u recognized pipeline states (%zu own programs)\n", status0.major, status0.minor,
             status0.layers, ownPrograms);
+        if (recorder)
+        {
+            const LONG seen = modules.recorded();
+            printf("recorder: %ld pipelines created through XefgPsoRecorder.dll%s\n", seen, stream ? " (streams)" : "");
+            if (size_t(seen) != programs.size() + ownPrograms) throw std::runtime_error("the recorder did not see every routed pipeline");
+        }
+        const std::string wrapperImage = expectWrapper ? "dxgi.dll+" : "XefgPsoWrapper.dll+";
+        if (strict)
+            return RefusedTest(g, programs.at(kSpecs[0].name), create1, {"\"reason\":\"caller\"", "\"caller\":\"" + wrapperImage,
+                "\"first\":\"XefgPsoRecorder.dll+", "\"provider_frame\":1,"});
+        if (wrapperStreamSubobject)
+            return RefusedTest(g, programs.at(kSpecs[0].name), create1, {"\"reason\":\"stream_subobject\",\"subobject_type\":9,\"offset\":40,",
+                "\"caller\":\"XefgPsoWrapper.dll+", "\"provider_frame\":0,"});
         if (status0.layers != programs.size() + ownPrograms) throw std::runtime_error("not every layer program was recognized");
+        if (recorder)
+        {
+            // Every layer recognized above the recorder: its line names XefgPsoRecorder.dll as the first frame after the wrapper's.
+            const auto layers = RouteLines("cuda_layer");
+            size_t stack = 0;
+            for (const auto& line : layers) stack += line.find("\"origin\":\"stack\",\"first\":\"XefgPsoRecorder.dll+") != std::string::npos;
+            const bool ok = layers.size() == xefg_cuda::Layers().size() && stack == layers.size() && RouteLines("cuda_pso_refused").empty();
+            printf("%s recorder: %zu cuda_layer lines, %zu recognized above XefgPsoRecorder.dll, %zu cuda_pso_refused\n", ok ? "PASS" : "FAIL",
+                layers.size(), stack, RouteLines("cuda_pso_refused").size());
+            if (!ok) throw std::runtime_error("--recorder: the layers were not recognized through the stack walk");
+        }
         g.MakeList(create1);
         const auto nativeList = NativeOf(g.list.Get()); // the list the route hooks (the runtime's, under a wrapper)
         if (expectWrapper && nativeList.Get() == static_cast<IUnknown*>(g.list.Get()))

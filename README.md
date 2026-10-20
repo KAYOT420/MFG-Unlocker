@@ -1,10 +1,12 @@
-# Universal MFG Unlocker V1.6.0
+# Universal MFG Unlocker V1.6.1
 
 Multi Frame Generation for Windows x64 games, in one DLL:
 
-- **DLSS Multi Frame Generation** controls on RTX 40 and RTX 30 series GPUs
-  (RTX 20 experimental), with fixed multipliers up to 6x and Dynamic MFG where
-  supported, on their own or through [OptiScaler](#optiscaler-support).
+- **DLSS Multi Frame Generation** controls on RTX 50, RTX 40 and RTX 30 series
+  GPUs (RTX 20 experimental), with fixed multipliers up to 6x and Dynamic MFG
+  where supported, on their own or through [OptiScaler](#optiscaler-support).
+  RTX 50 cards run DLSS MFG natively, so MFG Unlocker changes nothing in NVIDIA's
+  code there and only adds its menu controls.
 - **XeSS Multi Frame Generation (XeMFG)** on NVIDIA, AMD and Intel GPUs
   through [OptiScaler](#optiscaler-support).
 
@@ -14,6 +16,24 @@ per game MFG override maximum. A listed maximum does not guarantee that the
 active Frame Generation pipeline can apply it.
 
 If this mod helps you, [help me get through university on Ko-fi](https://ko-fi.com/dashdogy).
+
+## V1.6.1
+
+- **Change DLSS presets while you play, on every RTX card.** Live preset
+  switching now works on RTX 50, RTX 30 and RTX 20 cards as well as RTX 40:
+  the DLSS Frame Generation preset (Game/driver, A, B or C) and the DLSS
+  Super Resolution and Ray Reconstruction presets apply while the game runs.
+  Frame Generation restarts once when its preset changes. Vulkan games, and
+  DLSS Frame Generation versions that only have their original preset, still
+  need a game restart. See [Usage](#usage).
+- **RTX 50 series support.** MFG Unlocker recognises RTX 50 cards, and the
+  menu works there as on the other cards: MFG mode and Dynamic, the DLSS
+  presets, the Reflex FPS limit and the FPS readout. RTX 50 runs DLSS MFG
+  natively, so MFG Unlocker changes nothing in NVIDIA's code there.
+- **RTX 30 and RTX 20:** a fix for the DLSS Frame Generation option staying
+  greyed out when the NVIDIA app's DLSS override supplies DLSS Frame
+  Generation (reported in Final Fantasy VII Rebirth). If it still happens,
+  the log now says why.
 
 ## V1.6.0
 
@@ -77,12 +97,12 @@ Also new:
 
 ## Install
 
-The v1.6.0 download contains **`MFGUnlocker.dll`**. The menu is built in; no
+The v1.6.1 download contains **`MFGUnlocker.dll`**. The menu is built in; no
 separate ReShade or external loader installation is needed. To use OptiScaler,
 install it as an OptiScaler plugin instead; see [OptiScaler support](#optiscaler-support).
 
 1. Close the game. If upgrading, remove the old mod DLL as described below first.
-2. Download `MFGUnlocker-v1.6.0.zip` from [Releases](https://github.com/dashdogy/RTX40MFG-Unlock/releases)
+2. Download `MFGUnlocker-v1.6.1.zip` from [Releases](https://github.com/dashdogy/RTX40MFG-Unlock/releases)
    and extract it.
 3. Rename `MFGUnlocker.dll` to **one** supported filename below that the game
    loads early. Place it beside the **actual game executable**, not the launcher.
@@ -147,9 +167,10 @@ automatically after it has been shown and saved.
 - Choose **Follow game**, a fixed multiplier, or **Dynamic** when available.
 - Dynamic can target the display refresh rate or a custom FPS value.
 - Select **Game/driver**, **Preset A**, **Preset B**, or **Preset C
-  (performance)** where supported. On RTX 40 a new preset applies while Frame
-  Generation runs (it restarts Frame Generation once); on RTX 30 it needs a
-  game restart.
+  (performance)** where supported. A new preset applies while Frame Generation
+  runs (it restarts Frame Generation once) on RTX 50, RTX 40, RTX 30 and RTX 20
+  in DirectX 12 games. Vulkan games, and DLSS-G versions that only have their
+  original preset, need a game restart.
 - When the game runs **DLSS Super Resolution**, the menu shows it and lets you
   pick its preset (J, K, L or M); with **Ray Reconstruction** the same section
   offers D, E or F (F needs NVIDIA driver 580 or newer). A new preset applies
@@ -252,8 +273,10 @@ unavailable. Support is experimental and may stop working after a game patch.
 
 ## Compatibility and troubleshooting
 
-RTX 40 and RTX 30 have DirectX 12 and experimental Vulkan paths. RTX 20 support
-is experimental. Dynamic MFG is unavailable on Vulkan. XeMFG requires OptiScaler.
+RTX 50, RTX 40 and RTX 30 have DirectX 12 and experimental Vulkan paths. RTX 20
+support is experimental. On RTX 50 the menu offers the modes the game's DLSS
+Frame Generation reports, up to NVIDIA's per game maximum. Dynamic MFG is
+unavailable on Vulkan. XeMFG requires OptiScaler.
 Compatibility varies by game; artifacts, freezes, black screens and crashes
 remain possible.
 

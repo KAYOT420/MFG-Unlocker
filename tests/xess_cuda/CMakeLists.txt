@@ -22,6 +22,16 @@ if(NOT EXISTS "${XEFG_CUDA_FATBIN}" OR NOT IS_DIRECTORY "${XEFG_NATIVE_PROGRAMS}
     OR NOT IS_DIRECTORY "${XEFG_OWN_SHADERS}")
     message(FATAL_ERROR "Explicit XEFG_CUDA_FATBIN, XEFG_NATIVE_PROGRAMS, XEFG_PORTED_PROGRAMS and XEFG_OWN_SHADERS are required")
 endif()
+# psorefused.1 (board #543): a device wrapper and a module that hooks only pipeline creation (the shape of the SCSKiller
+# shader recorder's d3d12.dll under ReShade), each in its own image beside every test executable; loaded only by
+# --recorder / --wrapper-stream-subobject.
+add_library(XefgPsoWrapper SHARED pso_wrapper.cpp)
+add_library(XefgPsoRecorder SHARED pso_recorder.cpp)
+foreach(module XefgPsoWrapper XefgPsoRecorder)
+    target_compile_features(${module} PRIVATE cxx_std_20)
+    target_compile_definitions(${module} PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+    set_target_properties(${module} PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded")
+endforeach()
 function(xefg_cuda_test_target name)
     add_executable(${name} cuda_route_tests.cpp "${NATIVE}/xess/cuda/cuda_route.cpp")
     target_compile_features(${name} PRIVATE cxx_std_20)
@@ -29,6 +39,9 @@ function(xefg_cuda_test_target name)
     target_include_directories(${name} PRIVATE "${NATIVE}")
     target_link_libraries(${name} PRIVATE d3d12 dxgi bcrypt)
     set_target_properties(${name} PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded")
+    add_dependencies(${name} XefgPsoWrapper XefgPsoRecorder)
+    add_custom_command(TARGET ${name} POST_BUILD COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+        "$<TARGET_FILE:XefgPsoWrapper>" "$<TARGET_FILE:XefgPsoRecorder>" "$<TARGET_FILE_DIR:${name}>")
 endfunction()
 set(XEFG_CUDA_ARGS --fatbin "${XEFG_CUDA_FATBIN}" --programs "${XEFG_NATIVE_PROGRAMS}" --programs "${XEFG_PORTED_PROGRAMS}"
     --programs "${XEFG_OWN_SHADERS}")
@@ -40,6 +53,15 @@ add_test(NAME xefg_cuda_route_wrapped_device COMMAND XefgCudaRouteTests ${XEFG_C
 add_test(NAME xefg_cuda_route_architecture_gate COMMAND XefgCudaRouteTests --architecture-gate)
 # dredtable.1 (board #432): with DRED on, the system runtime keeps its shared class table.
 add_test(NAME xefg_cuda_route_dred COMMAND XefgCudaRouteTests ${XEFG_CUDA_ARGS} --list create --dred)
+# psorefused.1 (board #543): the provider's pipelines pass a module that hooks only pipeline creation, then a device wrapper
+# (XefgPsoWrapper.dll), as compute pipeline calls or as streams; its lists are created directly. With the route's stack
+# recognition every layer is recognized and launches; --strict (the rule before) recognizes none and the refusal names
+# the recorder module. A wrapper that adds a SAMPLE_MASK subobject to the compute stream: logged, not recognized.
+add_test(NAME xefg_cuda_route_recorder COMMAND XefgCudaRouteTests ${XEFG_CUDA_ARGS} --list create --recorder)
+add_test(NAME xefg_cuda_route_recorder_stream COMMAND XefgCudaRouteTests ${XEFG_CUDA_ARGS} --list create1 --recorder --stream)
+add_test(NAME xefg_cuda_route_recorder_strict COMMAND XefgCudaRouteTests ${XEFG_CUDA_ARGS} --list create --recorder --strict)
+add_test(NAME xefg_cuda_route_recorder_stream_strict COMMAND XefgCudaRouteTests ${XEFG_CUDA_ARGS} --list create --recorder --stream --strict)
+add_test(NAME xefg_cuda_route_wrapper_stream_subobject COMMAND XefgCudaRouteTests ${XEFG_CUDA_ARGS} --list create --wrapper-stream-subobject)
 if(XEFG_AGILITY_CORE)
     if(NOT EXISTS "${XEFG_AGILITY_CORE}" OR NOT XEFG_AGILITY_SDK_VERSION MATCHES "^[0-9]+$")
         message(FATAL_ERROR "XEFG_AGILITY_CORE must name a D3D12Core.dll and XEFG_AGILITY_SDK_VERSION its SDK version")
@@ -79,6 +101,9 @@ if(XEFG_RESHADE_DXGI)
     xefg_cuda_reshade_files(XefgCudaRouteTestsReShade)
     add_test(NAME xefg_cuda_route_reshade COMMAND XefgCudaRouteTestsReShade ${XEFG_CUDA_ARGS} --list create --expect-wrapper)
     add_test(NAME xefg_cuda_route_reshade_list1 COMMAND XefgCudaRouteTestsReShade ${XEFG_CUDA_ARGS} --list create1 --expect-wrapper)
+    # psorefused.1: the recorder module hooks ReShade's device table (the SCSKiller shape: recorder, then ReShade).
+    add_test(NAME xefg_cuda_route_reshade_recorder COMMAND XefgCudaRouteTestsReShade ${XEFG_CUDA_ARGS} --list create --expect-wrapper --recorder)
+    add_test(NAME xefg_cuda_route_reshade_recorder_strict COMMAND XefgCudaRouteTestsReShade ${XEFG_CUDA_ARGS} --list create --expect-wrapper --recorder --strict)
     if(XEFG_AGILITY_CORE)
         xefg_cuda_test_target(XefgCudaRouteTestsReShadeAgility)
         set_target_properties(XefgCudaRouteTestsReShadeAgility PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/reshade-agility")

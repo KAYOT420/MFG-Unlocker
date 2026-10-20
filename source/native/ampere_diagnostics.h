@@ -8,6 +8,7 @@ inline constexpr uint32_t kCreateSubmissionFailure = 172;
 inline constexpr uint32_t kEvaluationSubmissionFailure = 173;
 inline constexpr uint32_t kStartupAdmissionFailure = 174;
 inline constexpr uint32_t kRuntimeDispatchFailure = 176;
+inline constexpr uint32_t kStartupWrapperMissingFailure = 177;
 
 enum class Preparation : uint32_t
 {
@@ -119,6 +120,7 @@ constexpr const char* FailureName(uint32_t code) noexcept
     case kEvaluationSubmissionFailure: return "NGX evaluation failed";
     case kStartupAdmissionFailure: return "Streamline startup did not establish MFG admission";
     case kRuntimeDispatchFailure: return "NGX runtime dispatch target changed or is invalid";
+    case kStartupWrapperMissingFailure: return "no Streamline DLSS-G plug-in at device setup (unloaded during slInit or never loaded)";
     default: return "compatibility or ownership check failed";
     }
 }

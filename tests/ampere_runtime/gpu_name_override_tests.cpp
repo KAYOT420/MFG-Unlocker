@@ -116,11 +116,19 @@ int wmain()
         zeroed &= applied.Description[i] == L'\0';
     Check(zeroed, "no part of the real name survives after the reported one");
 
-    // Setting parser on real ini files.
-    wchar_t temp[MAX_PATH]{};
-    GetTempPathW(MAX_PATH, temp);
-    const auto directory = std::filesystem::path(temp) / (L"gpuname-tests-" + std::to_wstring(GetCurrentProcessId()));
-    std::filesystem::create_directories(directory);
+    // Setting parser on real ini files, beside this executable rather than in
+    // %TEMP%: an executable under a folder with a Low mandatory label runs at
+    // Low integrity and cannot create files in the user's %TEMP%.
+    wchar_t testPath[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, testPath, MAX_PATH);
+    const auto directory = std::filesystem::path(testPath).parent_path() / (L"gpuname-tests-" + std::to_wstring(GetCurrentProcessId()));
+    std::error_code error;
+    std::filesystem::create_directories(directory, error);
+    if (error)
+    {
+        std::cout << "SETUP cannot create the ini folder beside the executable (error " << error.value() << ")\n";
+        return 2;
+    }
     Check(SettingFrom(directory, nullptr) == Setting::eOff, "no ini file means off");
     Check(SettingFrom(directory, "[Overlay]\nToggleKey=8\n") == Setting::eOff, "no key means off");
     Check(SettingFrom(directory, "[Compatibility]\nGpuNameOverride=1\n") == Setting::eOn, "1 is on");
@@ -136,7 +144,7 @@ int wmain()
     Check(SettingFrom(directory, "[Other]\nGpuNameOverride=1\n") == Setting::eOff, "only the Compatibility section counts");
     Check(gpu_name_override::ReadSetting(nullptr) == Setting::eOff && gpu_name_override::ReadSetting(L"") == Setting::eOff,
         "no path means off");
-    std::filesystem::remove_all(directory);
+    std::filesystem::remove_all(directory, error);
 
     // Menu toggle: the executable's own RTX40MFG-UI.ini, other settings kept.
     {

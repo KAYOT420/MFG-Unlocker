@@ -80,6 +80,10 @@ struct CachedReader
     config::Layout config{}; // Immutable before module's release publication.
     std::atomic<bool> configReady{false};
     std::atomic<uint64_t> resets{0};
+    // V1.6.1: another route's detour owns the reader (RTX 30/20 translated
+    // route); immutable before module's release publication.
+    bool routeOwned = false;
+    entry_detour::Handle routeHook{};
 };
 std::array<CachedReader, 64> gCachedReaders{};
 std::mutex gCachedInstallMutex;
@@ -305,6 +309,16 @@ void* FindCachedReader(HMODULE module) noexcept
     __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
 }
 
+// Caller-classified record of one read through `reader`, whichever hook owns it.
+void RecordReaderRead(const CachedReader& reader, HMODULE provider, const void* caller,
+    bool valueValid, uint32_t value, bool overridden, ReadSource fallback) noexcept
+{
+    const auto address = reinterpret_cast<uintptr_t>(caller);
+    const auto source = address == reader.config.configurationReturn ? ReadSource::eConfiguration
+        : reader.config.report.Contains(address) ? ReadSource::eReport : fallback;
+    RecordRead(provider, valueValid, valueValid ? value : 0, overridden, source);
+}
+
 template <size_t Index>
 __declspec(noinline) bool HookCachedReader(uint32_t id, uint32_t* value) noexcept
 {
@@ -331,10 +345,8 @@ __declspec(noinline) bool HookCachedReader(uint32_t id, uint32_t* value) noexcep
         else result = original(id, value);
         reader.reads.fetch_add(1, std::memory_order_relaxed);
         const bool valueValid = result && Writable(value, sizeof(*value));
-        const auto address = reinterpret_cast<uintptr_t>(caller);
-        const auto source = address == reader.config.configurationReturn ? ReadSource::eConfiguration
-            : reader.config.report.Contains(address) ? ReadSource::eReport : ReadSource::eCached;
-        RecordRead(provider, valueValid, valueValid ? *value : 0, overridden, source);
+        RecordReaderRead(reader, provider, caller, valueValid, valueValid ? *value : 0, overridden,
+            ReadSource::eCached);
         return result;
     }
     return original(id, value);
@@ -387,7 +399,11 @@ bool ConfigHooksCurrent(const CachedReader& reader) noexcept
     for (auto kind : {entry_detour::Kind::eDlssgCachedPresetRead,
         entry_detour::Kind::eDlssgEndpointCreate, entry_detour::Kind::eDlssgEndpointEvaluate})
     {
-        const auto hook = entry_detour::ReadSnapshot(kind, module);
+        const bool routeReader = reader.routeOwned && kind == entry_detour::Kind::eDlssgCachedPresetRead;
+        // The owning route's exact entry, not an aggregate of its kind.
+        const auto hook = routeReader ? entry_detour::ReadSnapshot(reader.routeHook)
+            : entry_detour::ReadSnapshot(kind, module);
+        if (routeReader && (hook.owner != module || hook.kind != entry_detour::Kind::eAmperePreset)) return false;
         const auto target = kind == entry_detour::Kind::eDlssgCachedPresetRead
             ? reinterpret_cast<uintptr_t>(reader.target.load(std::memory_order_acquire))
             : kind == entry_detour::Kind::eDlssgEndpointCreate ? reader.config.create.begin : reader.config.evaluate.begin;
@@ -440,6 +456,8 @@ void InstallCachedReader(HMODULE module, uint64_t generation) noexcept
     }
 }
 
+std::atomic<bool> gNvapiFrameGenerationReads{true};
+
 __declspec(noinline) int32_t __cdecl HookGetSetting(
     void* session, void* profile, uint32_t id, Setting* setting) noexcept
 {
@@ -458,6 +476,7 @@ __declspec(noinline) int32_t __cdecl HookGetSetting(
     }
     const HMODULE provider = Owner(caller);
     const bool eligible = detour.current && id == kSettingId
+        && gNvapiFrameGenerationReads.load(std::memory_order_acquire)
         && dlssg_provider_policy::IsSupportedRetainedProvider(provider)
         && Writable(setting, sizeof(*setting));
     // Freeze before entering the driver. A simultaneous config reload must
@@ -622,6 +641,75 @@ bool ReadProvidersSupportLiveSwitch() noexcept
     return count != 0;
 }
 
+bool AdoptRouteReader(HMODULE module, void* reader, uint64_t generation,
+    entry_detour::Handle readerHook) noexcept
+{
+    if (!module || !reader || !generation || !readerHook) return false;
+    const auto hook = entry_detour::ReadSnapshot(readerHook);
+    if (!hook.current || hook.owner != module || hook.kind != entry_detour::Kind::eAmperePreset
+        || hook.target != reader || hook.generation != generation)
+        return false;
+    std::lock_guard lock(gCachedInstallMutex);
+    for (size_t index = 0; index != gCachedReaders.size(); ++index)
+    {
+        auto& entry = gCachedReaders[index];
+        if (const auto owner = entry.module.load(std::memory_order_acquire); owner == module)
+            return entry.routeOwned && entry.routeHook == readerHook && ConfigHooksCurrent(entry);
+        else if (owner) continue;
+        PresetCSupported(module); // Settle Preset C support outside the provider's own reads.
+        HMODULE pinned = nullptr;
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(module), &pinned)
+            || pinned != module) return false;
+        entry.config = config::Discover(module, reader);
+        entry.routeOwned = true;
+        entry.routeHook = readerHook;
+        entry.target.store(reader, std::memory_order_relaxed);
+        entry.generation.store(generation, std::memory_order_relaxed);
+        entry.failure.store(entry.config.slot ? 0 : 5, std::memory_order_relaxed);
+        // Published even for an unknown layout: the route's reads stay classified
+        // as route reads and the provider stays restart-only.
+        entry.module.store(module, std::memory_order_release);
+        if (!entry.config.slot) return false;
+        entry_detour::InstallOptions options{};
+        options.generation = generation;
+        options.allowRelocated = true;
+        void* original = nullptr;
+        // As in InstallCachedReader: both endpoint entries or no reset.
+        const bool create = entry_detour::Install(entry_detour::Kind::eDlssgEndpointCreate, module,
+            reinterpret_cast<void*>(entry.config.create.begin), reinterpret_cast<void*>(kCreateThunks[index]),
+            original, options);
+        const bool evaluate = entry_detour::Install(entry_detour::Kind::eDlssgEndpointEvaluate, module,
+            reinterpret_cast<void*>(entry.config.evaluate.begin), reinterpret_cast<void*>(kEvaluateThunks[index]),
+            original, options);
+        entry.configReady.store(create && evaluate, std::memory_order_release);
+        return ConfigHooksCurrent(entry);
+    }
+    return false;
+}
+
+void RecordRouteRead(HMODULE provider, const void* caller, bool valueValid, uint32_t value,
+    bool overridden) noexcept
+{
+    if (!provider) return;
+    for (const auto& reader : gCachedReaders)
+    {
+        if (reader.module.load(std::memory_order_acquire) != provider) continue;
+        if (reader.routeOwned)
+        {
+            RecordReaderRead(reader, provider, caller, valueValid, value, overridden, ReadSource::eRoute);
+            return;
+        }
+        break;
+    }
+    RecordRead(provider, valueValid, value, overridden, ReadSource::eRoute);
+}
+
+void SetNvapiFrameGenerationReads(bool enabled) noexcept
+{
+    gNvapiFrameGenerationReads.store(enabled, std::memory_order_release);
+}
+
 void SetSettingFilter(uint32_t id, SettingFilter filter) noexcept
 {
     if (!filter)
@@ -767,7 +855,8 @@ Snapshot ReadSnapshot(HMODULE provider) noexcept
     for (const auto& reader : gCachedReaders)
     {
         if (reader.module.load(std::memory_order_acquire) != provider) continue;
-        const auto cached = entry_detour::ReadSnapshot(entry_detour::Kind::eDlssgCachedPresetRead, provider);
+        const auto cached = reader.routeOwned ? entry_detour::ReadSnapshot(reader.routeHook)
+            : entry_detour::ReadSnapshot(entry_detour::Kind::eDlssgCachedPresetRead, provider);
         result.cachedReaderInstalled = cached.current
             && cached.generation == reader.generation.load(std::memory_order_acquire)
             && cached.target == reader.target.load(std::memory_order_acquire);
