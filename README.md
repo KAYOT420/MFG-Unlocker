@@ -20,7 +20,7 @@ If this mod helps you, [help me get through university on Ko-fi](https://ko-fi.c
 
 ## V1.7.0
 
-- **DLSS 5 in the menu.** With NVIDIA's DLSS 5 provider (`nvngx_dlssnr.dll`)
+- **DLSS 5 support in the menu.** With NVIDIA's DLSS 5 dll (`nvngx_dlssnr.dll`)
   beside the game's executable or MFG Unlocker, a **DLSS 5** tab applies DLSS 5
   in games that run DLSS Super Resolution, DLAA or Ray Reconstruction. Choose
   the **Hook Method** (Auto, Before upscaling, After upscaling or Present), a
@@ -29,7 +29,7 @@ If this mod helps you, [help me get through university on Ko-fi](https://ko-fi.c
   **Advanced** holds the rest. **Half rate** runs the network on every other
   frame for about half the cost (DirectX 12, Before or After upscaling). In
   Vulkan games DLSS 5 runs After upscaling or Auto. MFG Unlocker does not
-  include or download the provider, and the tab only appears when one is there.
+  include or download the dll, and the tab only appears when one is there.
 - **XeMFG standalone (experimental).** XeSS Multi Frame Generation without
   OptiScaler, in DirectX 12 and Vulkan games, at 2x to 6x or Dynamic. See
   [XeMFG standalone](#xemfg-standalone).
